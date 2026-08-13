@@ -1,12 +1,12 @@
 {
-  "name": "prompt-api-playground",
+  "name": "prompt-api-telemetry",
   "version": "1.0.0",
-  "description": "This is a demo of Chrome's experimental Prompt API.",
+  "description": "Observability PoC for Chrome's Prompt API — browser-side OpenTelemetry export.",
   "scripts": {
     "start": "npx http-server",
     "fix": "prettier --write ."
   },
-  "author": "Thomas Steiner (tomac@google.com)",
+  "author": "Julien Bataille (Rakuten Group, Inc.)",
   "license": "Apache-2.0",
   "devDependencies": {
     "http-server": "^14.1.1",
