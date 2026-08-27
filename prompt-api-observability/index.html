@@ -42,7 +42,11 @@
       <a href="https://developer.chrome.com/docs/ai/built-in"
         >built-in Prompt API</a
       >
-      powered by Gemini Nano.
+      powered by Gemini Nano, with traces exported to a local
+      <a href="https://mlflow.org/docs/latest/genai/tracing/quickstart/"
+        >MLflow</a
+      >
+      server via OpenTelemetry.
     </p>
     <div id="error-message"></div>
     <div id="prompt-area">
@@ -88,63 +92,8 @@
         <pre id="problem"></pre>
       </div>
     </div>
-    <details id="telemetry-setup">
-      <summary>Telemetry export (local dev)</summary>
-      <p>
-        Credentials are stored in <code>sessionStorage</code> for this tab only
-        — never in repo files. Default backend is <code>console</code> (DevTools).
-      </p>
-      <form id="telemetry-form">
-        <label>
-          Backend
-          <select id="telemetry-backend" name="backend">
-            <option value="console">console (DevTools)</option>
-            <option value="langfuse">Langfuse</option>
-            <option value="langsmith">LangSmith</option>
-          </select>
-        </label>
-        <label>
-          Service name
-          <input id="telemetry-service-name" name="serviceName" type="text" />
-        </label>
-        <fieldset id="telemetry-langfuse-fields">
-          <legend>Langfuse</legend>
-          <label>
-            Base URL
-            <input id="langfuse-base-url" name="langfuseBaseUrl" type="url" />
-          </label>
-          <label>
-            Public key
-            <input id="langfuse-public-key" name="langfusePublicKey" type="password" autocomplete="off" />
-          </label>
-          <label>
-            Secret key
-            <input id="langfuse-secret-key" name="langfuseSecretKey" type="password" autocomplete="off" />
-          </label>
-        </fieldset>
-        <fieldset id="telemetry-langsmith-fields">
-          <legend>LangSmith</legend>
-          <label>
-            Base URL
-            <input id="langsmith-base-url" name="langsmithBaseUrl" type="url" />
-          </label>
-          <label>
-            API key
-            <input id="langsmith-api-key" name="langsmithApiKey" type="password" autocomplete="off" />
-          </label>
-          <label>
-            Project
-            <input id="langsmith-project" name="langsmithProject" type="text" />
-          </label>
-        </fieldset>
-        <button type="submit">Apply and reload</button>
-        <button type="button" id="telemetry-clear">Clear saved config</button>
-      </form>
-    </details>
-    <footer>
-      Made by
-      <a href="https://github.com/tomayac/">@tomayac</a>. Source code on
-      <a href="https://github.com/GoogleChromeLabs/web-ai-demos">GitHub</a>.
+    <footer>Source code on
+      <a href="https://github.com/rakutenanalytics/web-ai-demos/tree/prompt-api-observability/prompt-api-observability">GitHub</a>.
     </footer>
   </body>
 </html>

@@ -1,1 +1,9 @@
 com.chrome.devtools.json
+
+# MLflow local tracking server (default: sqlite:///mlflow.db in cwd)
+mlflow.db
+mlflow.db-journal
+mlflow.db-wal
+mlflow.db-shm
+mlruns/
+mlartifacts/
