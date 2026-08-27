@@ -4,7 +4,7 @@
  *
  * OpenTelemetry instrumentation for the Prompt API playground.
  *
- * Spans follow OpenInference conventions and are exported directly from the browser to an OpenTelemetry Backend via OTLP/HTTP JSON.
+ * Spans follow OpenInference conventions and are exported to a local MLflow server via OTLP/HTTP JSON.
  */
 
 import {
@@ -16,8 +16,6 @@ import {
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import {
   BatchSpanProcessor,
-  SimpleSpanProcessor,
-  ConsoleSpanExporter,
 } from "@opentelemetry/sdk-trace-base";
 import { WebTracerProvider } from "@opentelemetry/sdk-trace-web";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
@@ -48,6 +46,10 @@ const MODEL = {
 const TRACER_NAME = "prompt-api-observability";
 const TRACER_VERSION = "0.1.0";
 
+const MLFLOW_TRACKING_URI = "http://localhost:5000";
+/** Required OTLP header — default experiment (see mlflow/server/otel_api.py). */
+const MLFLOW_DEFAULT_EXPERIMENT_ID = "0";
+
 let currentProvider = null;
 let tracer = trace.getTracer(TRACER_NAME, TRACER_VERSION);
 
@@ -61,13 +63,12 @@ function flattenMessages(prefix, messages) {
   return attrs;
 }
 
-/** @param {{ mode?: "console"|"otlp", serviceName?: string, otlpUrl?: string, otlpHeaders?: Record<string,string>, resourceAttributes?: Record<string,string> }} opts */
+/** @param {{ serviceName?: string, otlpUrl?: string, otlpHeaders?: Record<string,string>, resourceAttributes?: Record<string,string> }} opts */
 export async function initTelemetry(opts = {}) {
   const {
-    mode = "otlp",
-    serviceName = "prompt-api-playground",
-    otlpUrl,
-    otlpHeaders,
+    serviceName = TRACER_NAME,
+    otlpUrl = `${MLFLOW_TRACKING_URI}/v1/traces`,
+    otlpHeaders = { "x-mlflow-experiment-id": MLFLOW_DEFAULT_EXPERIMENT_ID },
     resourceAttributes,
   } = opts;
 
@@ -80,23 +81,17 @@ export async function initTelemetry(opts = {}) {
     currentProvider = null;
   }
 
-  const spanProcessors = [];
-  if (mode === "console") {
-    spanProcessors.push(new SimpleSpanProcessor(new ConsoleSpanExporter()));
-  } else if (mode === "otlp") {
-    if (!otlpUrl) throw new Error("initTelemetry: otlpUrl required");
-    spanProcessors.push(
-      new BatchSpanProcessor(new OTLPTraceExporter({ url: otlpUrl, headers: otlpHeaders ?? {} }))
-    );
-  }
-
   const provider = new WebTracerProvider({
     resource: resourceFromAttributes({
       "service.name": serviceName,
       "openinference.project.name": serviceName,
       ...(resourceAttributes ?? {}),
     }),
-    spanProcessors,
+    spanProcessors: [
+      new BatchSpanProcessor(
+        new OTLPTraceExporter({ url: otlpUrl, headers: otlpHeaders ?? {} }),
+      ),
+    ],
   });
 
   provider.register();

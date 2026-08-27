@@ -7,69 +7,11 @@ import { marked } from "https://cdn.jsdelivr.net/npm/marked@13.0.3/lib/marked.es
 import DOMPurify from "https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.es.mjs";
 
 import { initTelemetry, createInstrumentedSession } from "./telemetry.js";
-import {
-  loadTelemetryConfig,
-  saveTelemetryConfig,
-  clearTelemetryConfig,
-  toTelemetryOptions,
-} from "./config.js";
 
 const NUMBER_FORMAT_LANGUAGE = "en-US";
 const SYSTEM_PROMPT = "You are a helpful and friendly assistant.";
 
-function initTelemetrySetup() {
-  const form = document.getElementById("telemetry-form");
-  const backendSelect = document.getElementById("telemetry-backend");
-  const langfuseFields = document.getElementById("telemetry-langfuse-fields");
-  const langsmithFields = document.getElementById("telemetry-langsmith-fields");
-  const config = loadTelemetryConfig();
-
-  backendSelect.value = config.backend;
-  document.getElementById("telemetry-service-name").value = config.serviceName;
-  document.getElementById("langfuse-base-url").value = config.langfuse.baseUrl;
-  document.getElementById("langfuse-public-key").value = config.langfuse.publicKey;
-  document.getElementById("langfuse-secret-key").value = config.langfuse.secretKey;
-  document.getElementById("langsmith-base-url").value = config.langsmith.baseUrl;
-  document.getElementById("langsmith-api-key").value = config.langsmith.apiKey;
-  document.getElementById("langsmith-project").value = config.langsmith.project;
-
-  const syncFieldsets = () => {
-    langfuseFields.hidden = backendSelect.value !== "langfuse";
-    langsmithFields.hidden = backendSelect.value !== "langsmith";
-  };
-  backendSelect.addEventListener("change", syncFieldsets);
-  syncFieldsets();
-
-  form.addEventListener("submit", (e) => {
-    e.preventDefault();
-    saveTelemetryConfig({
-      backend: /** @type {import("./config.js").TelemetryBackend} */ (
-        backendSelect.value
-      ),
-      serviceName: document.getElementById("telemetry-service-name").value,
-      langfuse: {
-        baseUrl: document.getElementById("langfuse-base-url").value,
-        publicKey: document.getElementById("langfuse-public-key").value,
-        secretKey: document.getElementById("langfuse-secret-key").value,
-      },
-      langsmith: {
-        baseUrl: document.getElementById("langsmith-base-url").value,
-        apiKey: document.getElementById("langsmith-api-key").value,
-        project: document.getElementById("langsmith-project").value,
-      },
-    });
-    location.reload();
-  });
-
-  document.getElementById("telemetry-clear").addEventListener("click", () => {
-    clearTelemetryConfig();
-    location.reload();
-  });
-}
-
 (async () => {
-  initTelemetrySetup();
-
   const errorMessage = document.getElementById("error-message");
   const costSpan = document.getElementById("cost");
   const promptArea = document.getElementById("prompt-area");
@@ -85,7 +27,7 @@ function initTelemetrySetup() {
   const tokensLeftInfo = document.getElementById("tokens-left");
   const tokensSoFarInfo = document.getElementById("tokens-so-far");
 
-  await initTelemetry(toTelemetryOptions(loadTelemetryConfig()));
+  await initTelemetry();
 
   responseArea.style.display = "none";
 
