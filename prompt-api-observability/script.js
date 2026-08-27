@@ -220,6 +220,13 @@ const SYSTEM_PROMPT = "You are a helpful and friendly assistant.";
   const updateSession = async () => {
     if (self.LanguageModel) {
       session = await createInstrumentedSession({
+        expectedInputs: [
+          { type: "text", languages: ["en" /* system prompt */, "en" /* user prompt */] }
+        ],
+        expectedOutputs: [
+          { type: "text", languages: ["en"] }
+        ],
+        samplingMode: 'creative',
         initialPrompts: [
           {
             role: "system",
