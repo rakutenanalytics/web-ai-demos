@@ -21,30 +21,35 @@ There is no app backend. Run it with `npm start`. The chat UI matches the playgr
 | File | Change |
 | ---- | ------ |
 | `script.js` | Imports `telemetry.js` + `config.js`; calls `initTelemetry()` on load; replaces `LanguageModel.create()` with `createInstrumentedSession()` |
-| `index.html` | Adds an OpenTelemetry import map in `<head>` (loads SDK from esm.sh) |
+| `index.html` | Adds an OpenTelemetry import map in `<head>` (loads SDK from esm.sh) and a local-dev telemetry setup panel |
 | `telemetry.js` | **New.** OpenTelemetry setup, OTLP/console export, Prompt API span instrumentation |
-| `config.example.js` | **New.** Template for backend + credentials — copy to `config.js` |
-| `.gitignore` | **New.** Ignores `config.js` |
+| `config.js` | **New.** Client-side config from `sessionStorage` + URL params; OTLP header helpers |
 
-Suggested review order: this README → `script.js` (diff vs playground) → `index.html` (import map only) → `config.example.js` → `telemetry.js` (core).
+Suggested review order: this README → `script.js` (diff vs playground) → `index.html` (import map + setup panel) → `config.js` → `telemetry.js` (core).
 
 ## Setup
 
 ```bash
 cd prompt-api-observability
-cp config.example.js config.js   # first time only — the app won't load without config.js
-npm start                        # or: npx http-server
+npm start
 ```
 
-Edit `config.js`:
+Open http://localhost:8080. By default, spans go to the **console** backend (printed in DevTools).
 
-1. Set `backend` to `"langfuse"`, `"langsmith"`, or `"console"`
-2. Fill in the credentials for your chosen backend
-3. Reload the page
+### Configure export (Langfuse / LangSmith)
 
-Use `backend: "console"` to print spans to DevTools without exporting to an OpenTelemetry backend.
+Expand **Telemetry export (local dev)** on the page, enter credentials, and click **Apply and reload**. Values are stored in `sessionStorage` for the current tab only — nothing is written to disk or committed.
 
-`config.js` is gitignored — **never commit API keys**.
+### URL parameters (non-secrets)
+
+You can also set the backend or service name via query string:
+
+```
+http://localhost:8080/?backend=console
+http://localhost:8080/?backend=langfuse&service-name=my-demo
+```
+
+Credentials still come from the setup panel (or existing `sessionStorage` for that tab).
 
 ## What gets traced
 
@@ -60,7 +65,7 @@ Spans use [OpenInference](https://arize-ai.github.io/openinference/spec/) attrib
 
 ### Client-safe credentials (prerequisite for next phase)
 
-This PoC puts full API keys in `config.js`. That is acceptable for a local developer setup, but **not** for shipping observability in a public client. Moving beyond PoC requires a credential that is safe to embed in frontend code — something like a scoped ingestion token with trace-export-only permissions, analogous to a Measurement ID in analytics stacks (public, narrow scope, no account access). Observability providers would need to offer this kind of client-safe credential, or document a supported proxy that holds the secret server-side.
+This PoC stores credentials in `sessionStorage` via an in-page dev panel. That avoids committing secrets, but is **not** safe for shipping observability in a public client — exported traces still include prompts and responses, and keys are visible in the browser.
 
 ### Typed npm SDK
 
