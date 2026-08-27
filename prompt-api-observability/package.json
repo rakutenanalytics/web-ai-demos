@@ -1,9 +1,10 @@
 {
   "name": "prompt-api-observability",
   "version": "1.0.0",
-  "description": "Observability PoC for Chrome's Prompt API — browser-side OpenTelemetry export.",
+  "description": "Observability PoC for the Prompt API — browser-side OpenTelemetry export to MLflow.",
   "scripts": {
-    "start": "npx http-server",
+    "start": "npx devtools-json-generator . && npx http-server",
+    "mlflow": "uvx mlflow server",
     "fix": "prettier --write ."
   },
   "author": "Julien Bataille (Rakuten Group, Inc.)",
