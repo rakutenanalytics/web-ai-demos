@@ -137,9 +137,7 @@ export async function createInstrumentedSession(options = {}) {
 
       try {
         const session = await LanguageModel.create(options);
-        span.setAttributes({
-          "session.context_window": session.contextWindow ?? session.inputQuota ?? 0,
-        });
+        span.setAttributes(contextAttrs(session, readContextUsage(session)));
         span.setStatus({ code: SpanStatusCode.OK });
         return wrapSession(session, { sessionId, systemPrompt });
       } catch (err) {
@@ -208,6 +206,7 @@ async function tracedPrompt(session, state, input, opts) {
           [OI.OUTPUT_VALUE]: result,
           [OI.OUTPUT_MIME]: "text/plain",
           ...flattenMessages("llm.output_messages", [{ role: "assistant", content: result }]),
+          ...contextAttrs(session, tokensAfter),
           ...tokenAttrs(tokensBefore, tokensAfter),
         });
         span.setStatus({ code: SpanStatusCode.OK });
@@ -274,13 +273,15 @@ function tracedPromptStreaming(session, state, input, opts) {
           previousChunk = chunk;
           controller.enqueue(chunk);
         }
+        const tokensAfter = readContextUsage(session);
         span.setAttributes({
           [OI.OUTPUT_VALUE]: fullText,
           [OI.OUTPUT_MIME]: "text/plain",
           "llm.chunk_count": chunkCount,
           "llm.duration_ms": performance.now() - startedAt,
           ...flattenMessages("llm.output_messages", [{ role: "assistant", content: fullText }]),
-          ...tokenAttrs(tokensBefore, readContextUsage(session)),
+          ...contextAttrs(session, tokensAfter),
+          ...tokenAttrs(tokensBefore, tokensAfter),
         });
         span.setStatus({ code: SpanStatusCode.OK });
         controller.close();
@@ -304,8 +305,19 @@ function buildMessages(systemPrompt, input) {
   return messages;
 }
 
+function readContextWindow(session) {
+  return session.contextWindow ?? session.inputQuota ?? session.maxTokens ?? 0;
+}
+
 function readContextUsage(session) {
   return session.contextUsage ?? session.inputUsage ?? session.tokensSoFar ?? 0;
+}
+
+function contextAttrs(session, usage) {
+  return {
+    "session.context_window": readContextWindow(session),
+    "session.context_usage": Math.max(0, Math.round(usage)),
+  };
 }
 
 function tokenAttrs(before, after) {
