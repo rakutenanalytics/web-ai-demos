@@ -16,7 +16,7 @@ export const telemetryConfig = {
   backend: "console",
 
   /** OpenTelemetry service.name and OpenInference project name. */
-  serviceName: "prompt-api-telemetry",
+  serviceName: "prompt-api-observability",
 
   langfuse: {
     baseUrl: "https://cloud.langfuse.com",
@@ -27,7 +27,7 @@ export const telemetryConfig = {
   langsmith: {
     baseUrl: "https://api.smith.langchain.com",
     apiKey: "",
-    project: "prompt-api-telemetry",
+    project: "prompt-api-observability",
   },
 };
 
