@@ -45,7 +45,7 @@ const MODEL = {
   model: "gemini-nano",
 };
 
-const TRACER_NAME = "prompt-api-telemetry";
+const TRACER_NAME = "prompt-api-observability";
 const TRACER_VERSION = "0.1.0";
 
 let currentProvider = null;

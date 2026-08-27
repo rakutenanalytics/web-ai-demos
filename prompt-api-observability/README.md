@@ -1,4 +1,4 @@
-# Prompt API Telemetry
+# Prompt API Observability
 
 Observability PoC for Chrome's Prompt API — a standalone demo based on [`prompt-api-playground`](../prompt-api-playground).
 
@@ -31,7 +31,7 @@ Suggested review order: this README → `script.js` (diff vs playground) → `in
 ## Setup
 
 ```bash
-cd prompt-api-telemetry
+cd prompt-api-observability
 cp config.example.js config.js   # first time only — the app won't load without config.js
 npm start                        # or: npx http-server
 ```
