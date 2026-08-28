@@ -38,15 +38,18 @@
   <body>
     <h1>✨ Prompt API Playground</h1>
     <p>
-      This is a demo of Chrome's
-      <a href="https://developer.chrome.com/docs/ai/built-in"
-        >built-in Prompt API</a
+      This is a demo of the
+      <a href="https://webmachinelearning.github.io/prompt-api/">Prompt API</a>,
+      instrumented with the
+      <a
+        href="https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-spans.md"
+        >OpenTelemetry GenAI semantic conventions</a
       >
-      powered by Gemini Nano, with traces exported to a local
+      and exported over OTLP/HTTP to a local
       <a href="https://mlflow.org/docs/latest/genai/tracing/quickstart/"
         >MLflow</a
       >
-      server via OpenTelemetry.
+      server.
     </p>
     <div id="error-message"></div>
     <div id="prompt-area">
@@ -92,8 +95,12 @@
         <pre id="problem"></pre>
       </div>
     </div>
-    <footer>Source code on
-      <a href="https://github.com/rakutenanalytics/web-ai-demos/tree/prompt-api-observability/prompt-api-observability">GitHub</a>.
+    <footer>
+      Source code on
+      <a
+        href="https://github.com/rakutenanalytics/web-ai-demos/tree/prompt-api-observability/prompt-api-observability"
+        >GitHub</a
+      >.
     </footer>
   </body>
 </html>

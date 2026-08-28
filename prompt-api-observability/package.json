@@ -1,7 +1,7 @@
 {
   "name": "prompt-api-observability",
   "version": "1.0.0",
-  "description": "Observability PoC for the Prompt API — browser-side OpenTelemetry export to MLflow.",
+  "description": "Observability PoC for the Prompt API — browser-side OpenTelemetry GenAI tracing to MLflow.",
   "scripts": {
     "start": "npx devtools-json-generator . && npx http-server",
     "mlflow": "uvx mlflow server",

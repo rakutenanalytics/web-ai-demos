@@ -4,72 +4,165 @@
  *
  * OpenTelemetry instrumentation for the Prompt API playground.
  *
- * Spans follow OpenInference conventions and are exported to a local MLflow server via OTLP/HTTP JSON.
+ * Spans follow the OpenTelemetry GenAI semantic conventions and go to a local
+ * MLflow server over OTLP/HTTP JSON. MLflow reads `gen_ai.*` natively, so no
+ * collector is needed.
+ *
+ * Conventions transcribed from open-telemetry/semantic-conventions-genai at
+ * commit 67dff02 (2026-08-27). See README for the reasoning behind each
+ * mapping choice.
  */
 
-import {
-  trace,
-  context,
-  SpanStatusCode,
-  SpanKind,
-} from "@opentelemetry/api";
+import { trace, context, SpanStatusCode, SpanKind } from "@opentelemetry/api";
 import { resourceFromAttributes } from "@opentelemetry/resources";
-import {
-  BatchSpanProcessor,
-} from "@opentelemetry/sdk-trace-base";
+import { BatchSpanProcessor } from "@opentelemetry/sdk-trace-base";
 import { WebTracerProvider } from "@opentelemetry/sdk-trace-web";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
 
-const OI = {
-  SPAN_KIND: "openinference.span.kind",
-  INPUT_VALUE: "input.value",
-  INPUT_MIME: "input.mime_type",
-  OUTPUT_VALUE: "output.value",
-  OUTPUT_MIME: "output.mime_type",
-  LLM_SYSTEM: "llm.system",
-  LLM_PROVIDER: "llm.provider",
-  LLM_MODEL: "llm.model_name",
-  LLM_TOKEN_PROMPT: "llm.token_count.prompt",
-  LLM_TOKEN_COMPLETION: "llm.token_count.completion",
-  LLM_TOKEN_TOTAL: "llm.token_count.total",
-  SESSION_ID: "session.id",
-};
-
-const OI_KIND = { LLM: "LLM", CHAIN: "CHAIN" };
-
-const MODEL = {
-  system: "chrome-built-in-ai",
-  provider: "google",
-  model: "gemini-nano",
-};
-
-const TRACER_NAME = "prompt-api-observability";
-const TRACER_VERSION = "0.1.0";
+// --- Tweak here ------------------------------------------------------------
 
 const MLFLOW_TRACKING_URI = "http://localhost:5000";
 /** Required OTLP header — default experiment (see mlflow/server/otel_api.py). */
 const MLFLOW_DEFAULT_EXPERIMENT_ID = "0";
 
+/** Set to false to keep prompts and responses out of exported spans. */
+const CAPTURE_CONTENT = true;
+
+/**
+ * No registry value exists for browser built-in models. This names the
+ * implementation supplying the model, not the API, so change it on other
+ * browsers.
+ */
+const PROVIDER_NAME = "google.chrome";
+
+// --- Semantic conventions --------------------------------------------------
+
+const GEN_AI = {
+  OPERATION_NAME: "gen_ai.operation.name",
+  PROVIDER_NAME: "gen_ai.provider.name",
+  REQUEST_STREAM: "gen_ai.request.stream",
+  OUTPUT_TYPE: "gen_ai.output.type",
+  INPUT_MESSAGES: "gen_ai.input.messages",
+  OUTPUT_MESSAGES: "gen_ai.output.messages",
+  SYSTEM_INSTRUCTIONS: "gen_ai.system_instructions",
+  TIME_TO_FIRST_CHUNK: "gen_ai.response.time_to_first_chunk",
+  FINISH_REASONS: "gen_ai.response.finish_reasons",
+  CONVERSATION_ID: "gen_ai.conversation.id",
+  CONVERSATION_COMPACTED: "gen_ai.conversation.compacted",
+};
+
+/**
+ * Prompt API concepts no OTel convention covers, namespaced so they cannot
+ * collide with a future standard name. The context values are session-context
+ * measurements in context-window units, not per-request token usage, so they
+ * deliberately do not map onto `gen_ai.usage.*`.
+ */
+const WEB_AI = {
+  BROWSER_NAME: "web_ai.runtime.browser.name",
+  BROWSER_VERSION: "web_ai.runtime.browser.version",
+  CONTEXT_WINDOW: "web_ai.context.window_tokens",
+  CONTEXT_USAGE_BEFORE: "web_ai.context.usage_before_tokens",
+  CONTEXT_USAGE_AFTER: "web_ai.context.usage_after_tokens",
+  CONTEXT_USAGE_DELTA: "web_ai.context.usage_delta_tokens",
+  CONTEXT_REMAINING_AFTER: "web_ai.context.remaining_after_tokens",
+  CONTEXT_UTILIZATION_AFTER: "web_ai.context.utilization_after",
+  CONTEXT_OVERFLOWED: "web_ai.context.overflowed",
+  CHUNK_COUNT: "web_ai.stream.chunk_count",
+  TURN_INDEX: "web_ai.conversation.turn_index",
+  SAMPLING_MODE: "web_ai.request.sampling_mode",
+};
+
+const ERROR_TYPE = "error.type";
+const SESSION_ID = "session.id";
+
+/**
+ * The spec's span name is `{operation} {request.model}`, but the Prompt API
+ * exposes no model identifier, so the model half is omitted rather than
+ * invented. Same reason `gen_ai.request.model`, `gen_ai.response.model` and
+ * `gen_ai.usage.*` are never set below.
+ */
+const OPERATION = "generate_content";
+
+const TRACER_NAME = "prompt-api-observability";
+const TRACER_VERSION = "0.2.0";
+
 let currentProvider = null;
 let tracer = trace.getTracer(TRACER_NAME, TRACER_VERSION);
 
-function flattenMessages(prefix, messages) {
-  const attrs = {};
-  messages.forEach((msg, i) => {
-    attrs[`${prefix}.${i}.message.role`] = msg.role;
-    attrs[`${prefix}.${i}.message.content`] =
-      typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
-  });
-  return attrs;
+/**
+ * Groups every trace from this browser application session, across all
+ * conversations. In sessionStorage so a reload keeps it and a new tab gets a
+ * new one.
+ */
+const applicationSessionId = (() => {
+  const key = "web-ai.session.id";
+  try {
+    const existing = sessionStorage.getItem(key);
+    if (existing) return existing;
+    const created = crypto.randomUUID();
+    sessionStorage.setItem(key, created);
+    return created;
+  } catch {
+    return crypto.randomUUID();
+  }
+})();
+
+// --- Setup -----------------------------------------------------------------
+
+/** GREASE noise entries: "Not;A=Brand" and its rotating punctuation variants. */
+const isRealBrand = (b) =>
+  b.brand.replace(/[^a-z]/gi, "").toLowerCase() !== "notabrand";
+
+/** Prefer the specific brand over the "Chromium" engine entry. */
+const pickBrand = (brands = []) => {
+  const real = brands.filter(isRealBrand);
+  return real.find((b) => !/^chromium$/i.test(b.brand)) ?? real[0];
+};
+
+/**
+ * The browser is the Prompt API runtime — it supplies the model and dominates
+ * performance — so record its identity on every trace. Low-entropy hints ride
+ * on every request already via `Sec-CH-UA*`; `getHighEntropyValues()` adds a
+ * little fingerprinting surface in exchange for a full patch version.
+ */
+async function browserResourceAttributes() {
+  const attributes = {
+    "browser.language": navigator.language,
+    "user_agent.original": navigator.userAgent,
+  };
+  const uaData = navigator.userAgentData;
+  // No UA Client Hints: don't regex the UA string, and per the convention don't
+  // fall back to the legacy navigator.platform.
+  if (!uaData) return attributes;
+
+  attributes["browser.brands"] = uaData.brands.map(
+    (b) => `${b.brand} ${b.version}`,
+  );
+  attributes["browser.mobile"] = uaData.mobile;
+  attributes["browser.platform"] = uaData.platform;
+
+  let brand = pickBrand(uaData.brands);
+  try {
+    const { fullVersionList } = await uaData.getHighEntropyValues([
+      "fullVersionList",
+    ]);
+    brand = pickBrand(fullVersionList) ?? brand;
+  } catch {
+    // Keep the low-entropy major version.
+  }
+  if (brand) {
+    attributes[WEB_AI.BROWSER_NAME] = brand.brand;
+    attributes[WEB_AI.BROWSER_VERSION] = brand.version;
+  }
+  return attributes;
 }
 
-/** @param {{ serviceName?: string, otlpUrl?: string, otlpHeaders?: Record<string,string>, resourceAttributes?: Record<string,string> }} opts */
+/** @param {{ serviceName?: string, otlpUrl?: string, otlpHeaders?: Record<string,string> }} opts */
 export async function initTelemetry(opts = {}) {
   const {
     serviceName = TRACER_NAME,
     otlpUrl = `${MLFLOW_TRACKING_URI}/v1/traces`,
     otlpHeaders = { "x-mlflow-experiment-id": MLFLOW_DEFAULT_EXPERIMENT_ID },
-    resourceAttributes,
   } = opts;
 
   if (currentProvider) {
@@ -84,12 +177,11 @@ export async function initTelemetry(opts = {}) {
   const provider = new WebTracerProvider({
     resource: resourceFromAttributes({
       "service.name": serviceName,
-      "openinference.project.name": serviceName,
-      ...(resourceAttributes ?? {}),
+      ...(await browserResourceAttributes()),
     }),
     spanProcessors: [
       new BatchSpanProcessor(
-        new OTLPTraceExporter({ url: otlpUrl, headers: otlpHeaders ?? {} }),
+        new OTLPTraceExporter({ url: otlpUrl, headers: otlpHeaders }),
       ),
     ],
   });
@@ -98,10 +190,10 @@ export async function initTelemetry(opts = {}) {
   currentProvider = provider;
   tracer = provider.getTracer(TRACER_NAME, TRACER_VERSION);
 
-  window.addEventListener("visibilitychange", () => {
+  addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") provider.forceFlush();
   });
-  window.addEventListener("beforeunload", () => provider.forceFlush());
+  addEventListener("pagehide", () => provider.forceFlush());
 
   return provider;
 }
@@ -115,217 +207,356 @@ export async function flushTelemetry() {
   }
 }
 
-export async function createInstrumentedSession(options = {}) {
-  return tracer.startActiveSpan(
-    "LanguageModel.create",
-    { kind: SpanKind.CLIENT },
-    async (span) => {
-      const sessionId = crypto.randomUUID();
-      const initialPrompts = options.initialPrompts ?? [];
-      const systemPrompt = initialPrompts.find((p) => p.role === "system")?.content;
+// --- Message encoding ------------------------------------------------------
 
-      span.setAttributes({
-        [OI.SPAN_KIND]: OI_KIND.CHAIN,
-        [OI.SESSION_ID]: sessionId,
-        [OI.LLM_SYSTEM]: MODEL.system,
-        [OI.LLM_PROVIDER]: MODEL.provider,
-        [OI.LLM_MODEL]: MODEL.model,
-        [OI.INPUT_VALUE]: JSON.stringify(options),
-        [OI.INPUT_MIME]: "application/json",
-      });
-      if (systemPrompt) span.setAttribute("session.system_prompt", systemPrompt);
+/**
+ * `gen_ai.{input,output}.messages` and `gen_ai.system_instructions` follow the
+ * GenAI message JSON schemas. They are written as JSON strings because
+ * OpenTelemetry JS has no structured attribute support and the spec permits
+ * the fallback (see README).
+ */
+function encodeInputMessages(input) {
+  if (typeof input === "string") {
+    return [{ role: "user", parts: [{ type: "text", content: input }] }];
+  }
+  const messages = Array.isArray(input) ? input : [input];
+  return messages.map((message) => ({
+    role: message.role ?? "user",
+    parts: encodeParts(message.content),
+  }));
+}
 
-      try {
-        const session = await LanguageModel.create(options);
-        span.setAttributes(contextAttrs(session, readContextUsage(session)));
-        span.setStatus({ code: SpanStatusCode.OK });
-        return wrapSession(session, { sessionId, systemPrompt });
-      } catch (err) {
-        span.recordException(err);
-        span.setStatus({ code: SpanStatusCode.ERROR, message: String(err?.message ?? err) });
-        throw err;
-      } finally {
-        span.end();
-      }
-    }
+function encodeParts(content) {
+  if (typeof content === "string") return [{ type: "text", content }];
+  if (!Array.isArray(content)) return [];
+
+  return content.map((part) =>
+    part.type === "text"
+      ? { type: "text", content: String(part.value) }
+      : // Never export image or audio bytes. This is a GenericPart, which needs
+        // only `type`; a BlobPart would require inline base64 content.
+        { type: "redacted", modality: part.type },
   );
 }
 
+/** `finish_reason` is required by the output message schema. */
+const encodeOutputMessages = (text, finishReason) => [
+  {
+    role: "assistant",
+    parts: [{ type: "text", content: text }],
+    finish_reason: finishReason,
+  },
+];
+
+// --- Context measurements --------------------------------------------------
+
+/** `contextWindow` is current; `inputQuota` is the deprecated spelling. */
+function readContextWindow(session) {
+  const value = session.contextWindow ?? session.inputQuota;
+  return Number.isFinite(value) ? value : undefined;
+}
+
+/** `contextUsage` is current; `inputUsage` is the deprecated spelling. */
+function readContextUsage(session) {
+  const value = session.contextUsage ?? session.inputUsage;
+  return Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * The delta is signed on purpose: when context overflow drops earlier turns,
+ * usage goes down, and that decrease is the interesting signal.
+ */
+function contextAttributes(windowTokens, before, after) {
+  const attributes = {};
+  if (windowTokens !== undefined) {
+    attributes[WEB_AI.CONTEXT_WINDOW] = windowTokens;
+  }
+  if (before !== undefined) attributes[WEB_AI.CONTEXT_USAGE_BEFORE] = before;
+  if (after === undefined) return attributes;
+
+  attributes[WEB_AI.CONTEXT_USAGE_AFTER] = after;
+  if (before !== undefined) {
+    attributes[WEB_AI.CONTEXT_USAGE_DELTA] = after - before;
+  }
+  if (windowTokens) {
+    attributes[WEB_AI.CONTEXT_REMAINING_AFTER] = windowTokens - after;
+    attributes[WEB_AI.CONTEXT_UTILIZATION_AFTER] = after / windowTokens;
+  }
+  return attributes;
+}
+
+// --- Instrumentation -------------------------------------------------------
+
+/**
+ * Creates a `LanguageModel` session and wraps it.
+ *
+ * `conversationId` is passed separately from the Prompt API options so it is
+ * never forwarded to `LanguageModel.create()` and never reaches the model.
+ *
+ * @param {any} options Passed verbatim to `LanguageModel.create()`.
+ * @param {{ conversationId?: string }} telemetryOptions
+ */
+export async function createInstrumentedSession(
+  options = {},
+  telemetryOptions = {},
+) {
+  /**
+   * One id per LanguageModel session, which is the thing that owns the
+   * conversation history. Reused for every turn — never regenerated per span,
+   * never the trace id, never derived from prompt content.
+   */
+  const conversationId = telemetryOptions.conversationId ?? crypto.randomUUID();
+  const systemPrompt = options.initialPrompts?.find(
+    (p) => p.role === "system",
+  )?.content;
+
+  // Not a GenAI inference span: creating a session generates nothing.
+  const span = tracer.startSpan("web_ai.create_session", {
+    kind: SpanKind.INTERNAL,
+    attributes: {
+      [GEN_AI.CONVERSATION_ID]: conversationId,
+      [SESSION_ID]: applicationSessionId,
+    },
+  });
+
+  try {
+    const session = await LanguageModel.create(options);
+    const windowTokens = readContextWindow(session);
+    if (windowTokens !== undefined) {
+      span.setAttribute(WEB_AI.CONTEXT_WINDOW, windowTokens);
+    }
+    span.setStatus({ code: SpanStatusCode.OK });
+    return wrapSession(session, { conversationId, systemPrompt });
+  } catch (err) {
+    recordError(span, err);
+    throw err;
+  } finally {
+    span.end();
+  }
+}
+
 function wrapSession(session, meta) {
-  const state = { ...meta, turnIndex: 0 };
+  const state = {
+    ...meta,
+    turnIndex: 0,
+    compacted: false,
+    activeSpans: new Set(),
+  };
+
+  // `contextoverflow` means the browser dropped earlier turns to fit the
+  // window, which is what gen_ai.conversation.compacted describes. It stays
+  // true for every later turn on this conversation.
+  session.addEventListener?.("contextoverflow", () => {
+    state.compacted = true;
+    for (const span of state.activeSpans) {
+      span.addEvent("web_ai.context_overflow");
+      span.setAttribute(WEB_AI.CONTEXT_OVERFLOWED, true);
+      span.setAttribute(GEN_AI.CONVERSATION_COMPACTED, true);
+    }
+  });
+
   return new Proxy(session, {
-    get(target, prop, receiver) {
-      if (prop === "prompt") return (input, opts) => tracedPrompt(target, state, input, opts);
+    get(target, prop) {
+      if (prop === "prompt") {
+        return (input, opts) => tracedPrompt(target, state, input, opts);
+      }
       if (prop === "promptStreaming") {
-        return (input, opts) => tracedPromptStreaming(target, state, input, opts);
+        return (input, opts) =>
+          tracedPromptStreaming(target, state, input, opts);
       }
       if (prop === "destroy") {
         return () => {
           try {
             return target.destroy();
           } finally {
-            const span = tracer.startSpan("LanguageModel.destroy");
-            span.setAttributes({ [OI.SPAN_KIND]: OI_KIND.CHAIN, [OI.SESSION_ID]: state.sessionId });
-            span.end();
+            tracer
+              .startSpan("web_ai.destroy_session", {
+                kind: SpanKind.INTERNAL,
+                attributes: {
+                  [GEN_AI.CONVERSATION_ID]: state.conversationId,
+                  [SESSION_ID]: applicationSessionId,
+                },
+              })
+              .end();
           }
         };
       }
-      // Native getters (contextWindow, contextUsage, …) require the real session
-      // as `this`. Using the Proxy as receiver causes "Illegal invocation".
+      // Native getters (contextWindow, contextUsage, …) need the real session as
+      // `this`; using the Proxy as receiver throws "Illegal invocation".
       const value = Reflect.get(target, prop, target);
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
 }
 
-async function tracedPrompt(session, state, input, opts) {
+/** Attributes known before the model runs. Set at creation so samplers see them. */
+function requestAttributes(session, state, input, opts, streaming) {
   state.turnIndex += 1;
+
+  const attributes = {
+    [GEN_AI.OPERATION_NAME]: OPERATION,
+    [GEN_AI.PROVIDER_NAME]: PROVIDER_NAME,
+    [GEN_AI.CONVERSATION_ID]: state.conversationId,
+    [SESSION_ID]: applicationSessionId,
+    [WEB_AI.TURN_INDEX]: state.turnIndex,
+  };
+
+  if (streaming) attributes[GEN_AI.REQUEST_STREAM] = true;
+  if (opts?.responseConstraint) attributes[GEN_AI.OUTPUT_TYPE] = "json";
+  if (session.samplingMode) {
+    attributes[WEB_AI.SAMPLING_MODE] = session.samplingMode;
+  }
+  // Never written as false: the convention treats it as a positive indicator
+  // only and requires it left unset otherwise.
+  if (state.compacted) attributes[GEN_AI.CONVERSATION_COMPACTED] = true;
+
+  if (CAPTURE_CONTENT) {
+    attributes[GEN_AI.INPUT_MESSAGES] = JSON.stringify(
+      encodeInputMessages(input),
+    );
+    if (state.systemPrompt) {
+      attributes[GEN_AI.SYSTEM_INSTRUCTIONS] = JSON.stringify([
+        { type: "text", content: state.systemPrompt },
+      ]);
+    }
+  }
+
+  return attributes;
+}
+
+/** Attributes known once the call settled. */
+function resultAttributes(session, state, windowTokens, before, text, finish) {
+  const attributes = {
+    ...contextAttributes(windowTokens, before, readContextUsage(session)),
+    [GEN_AI.FINISH_REASONS]: [finish],
+  };
+  if (state.compacted) attributes[GEN_AI.CONVERSATION_COMPACTED] = true;
+  if (CAPTURE_CONTENT && text !== undefined) {
+    attributes[GEN_AI.OUTPUT_MESSAGES] = JSON.stringify(
+      encodeOutputMessages(text, finish),
+    );
+  }
+  return attributes;
+}
+
+function recordError(span, err) {
+  span.recordException(err);
+  span.setAttribute(ERROR_TYPE, err?.name ?? "Error");
+  span.setStatus({
+    code: SpanStatusCode.ERROR,
+    message: String(err?.message ?? err),
+  });
+}
+
+/** Separates `AbortSignal` cancellation from a real failure. */
+const finishReasonFor = (err) =>
+  err?.name === "AbortError" ? "abort" : "error";
+
+/**
+ * INTERNAL, not CLIENT: the model runs in the same process. The convention
+ * reserves CLIENT for calls crossing a process boundary and explicitly permits
+ * INTERNAL for in-process models.
+ */
+const SPAN_OPTIONS = { kind: SpanKind.INTERNAL };
+
+async function tracedPrompt(session, state, input, opts) {
+  const windowTokens = readContextWindow(session);
+  const before = readContextUsage(session);
+  const attributes = requestAttributes(session, state, input, opts, false);
+
   return tracer.startActiveSpan(
-    "LanguageModel.prompt",
-    { kind: SpanKind.CLIENT },
+    OPERATION,
+    { ...SPAN_OPTIONS, attributes },
     async (span) => {
-      const messages = buildMessages(state.systemPrompt, input);
-      const tokensBefore = readContextUsage(session);
-
-      span.setAttributes({
-        [OI.SPAN_KIND]: OI_KIND.LLM,
-        [OI.SESSION_ID]: state.sessionId,
-        [OI.LLM_SYSTEM]: MODEL.system,
-        [OI.LLM_PROVIDER]: MODEL.provider,
-        [OI.LLM_MODEL]: MODEL.model,
-        [OI.INPUT_VALUE]: typeof input === "string" ? input : JSON.stringify(input),
-        [OI.INPUT_MIME]: typeof input === "string" ? "text/plain" : "application/json",
-        "llm.turn_index": state.turnIndex,
-        ...flattenMessages("llm.input_messages", messages),
-      });
-
+      state.activeSpans.add(span);
       try {
-        const result = await session.prompt(input, opts);
-        const tokensAfter = readContextUsage(session);
-        span.setAttributes({
-          [OI.OUTPUT_VALUE]: result,
-          [OI.OUTPUT_MIME]: "text/plain",
-          ...flattenMessages("llm.output_messages", [{ role: "assistant", content: result }]),
-          ...contextAttrs(session, tokensAfter),
-          ...tokenAttrs(tokensBefore, tokensAfter),
-        });
+        const text = await session.prompt(input, opts);
+        span.setAttributes(
+          resultAttributes(session, state, windowTokens, before, text, "stop"),
+        );
         span.setStatus({ code: SpanStatusCode.OK });
-        return result;
+        return text;
       } catch (err) {
-        span.recordException(err);
-        span.setStatus({ code: SpanStatusCode.ERROR, message: String(err?.message ?? err) });
+        span.setAttributes(
+          // No text: the response never completed.
+          resultAttributes(
+            session,
+            state,
+            windowTokens,
+            before,
+            undefined,
+            finishReasonFor(err),
+          ),
+        );
+        recordError(span, err);
         throw err;
       } finally {
+        state.activeSpans.delete(span);
         span.end();
       }
-    }
+    },
   );
 }
 
 function tracedPromptStreaming(session, state, input, opts) {
-  state.turnIndex += 1;
-  const messages = buildMessages(state.systemPrompt, input);
-  const tokensBefore = readContextUsage(session);
+  const windowTokens = readContextWindow(session);
+  const before = readContextUsage(session);
+  const attributes = requestAttributes(session, state, input, opts, true);
 
-  const span = tracer.startSpan("LanguageModel.promptStreaming", { kind: SpanKind.CLIENT }, context.active());
-  span.setAttributes({
-    [OI.SPAN_KIND]: OI_KIND.LLM,
-    [OI.SESSION_ID]: state.sessionId,
-    [OI.LLM_SYSTEM]: MODEL.system,
-    [OI.LLM_PROVIDER]: MODEL.provider,
-    [OI.LLM_MODEL]: MODEL.model,
-    [OI.INPUT_VALUE]: typeof input === "string" ? input : JSON.stringify(input),
-    [OI.INPUT_MIME]: typeof input === "string" ? "text/plain" : "application/json",
-    "llm.turn_index": state.turnIndex,
-    "llm.streaming": true,
-    ...flattenMessages("llm.input_messages", messages),
-  });
-
-  let underlying;
-  try {
-    underlying = session.promptStreaming(input, opts);
-  } catch (err) {
-    span.recordException(err);
-    span.setStatus({ code: SpanStatusCode.ERROR, message: String(err?.message ?? err) });
-    span.end();
-    throw err;
-  }
+  const span = tracer.startSpan(
+    OPERATION,
+    { ...SPAN_OPTIONS, attributes },
+    context.active(),
+  );
+  state.activeSpans.add(span);
 
   const startedAt = performance.now();
   let firstChunkAt = null;
   let chunkCount = 0;
-  let fullText = "";
-  let previousChunk = "";
+  let text = "";
 
+  // One span for the whole stream: it stays open until the stream is fully
+  // consumed or fails.
   return new ReadableStream({
     async start(controller) {
       try {
-        for await (const chunk of underlying) {
+        for await (const chunk of session.promptStreaming(input, opts)) {
           chunkCount += 1;
-          if (firstChunkAt === null) {
-            firstChunkAt = performance.now();
-            span.addEvent("llm.first_token", {
-              "llm.time_to_first_token_ms": firstChunkAt - startedAt,
-            });
-          }
-          const delta = chunk.startsWith(previousChunk) ? chunk.slice(previousChunk.length) : chunk;
-          fullText += delta;
-          previousChunk = chunk;
+          if (firstChunkAt === null) firstChunkAt = performance.now();
+          text += chunk;
           controller.enqueue(chunk);
         }
-        const tokensAfter = readContextUsage(session);
-        span.setAttributes({
-          [OI.OUTPUT_VALUE]: fullText,
-          [OI.OUTPUT_MIME]: "text/plain",
-          "llm.chunk_count": chunkCount,
-          "llm.duration_ms": performance.now() - startedAt,
-          ...flattenMessages("llm.output_messages", [{ role: "assistant", content: fullText }]),
-          ...contextAttrs(session, tokensAfter),
-          ...tokenAttrs(tokensBefore, tokensAfter),
-        });
+        span.setAttributes(
+          resultAttributes(session, state, windowTokens, before, text, "stop"),
+        );
         span.setStatus({ code: SpanStatusCode.OK });
         controller.close();
       } catch (err) {
-        span.recordException(err);
-        span.setStatus({ code: SpanStatusCode.ERROR, message: String(err?.message ?? err) });
+        // Keep the partial text: seeing where generation stopped is the point.
+        span.setAttributes(
+          resultAttributes(
+            session,
+            state,
+            windowTokens,
+            before,
+            text,
+            finishReasonFor(err),
+          ),
+        );
+        recordError(span, err);
         controller.error(err);
       } finally {
+        span.setAttribute(WEB_AI.CHUNK_COUNT, chunkCount);
+        if (firstChunkAt !== null) {
+          // Seconds, per the convention.
+          span.setAttribute(
+            GEN_AI.TIME_TO_FIRST_CHUNK,
+            (firstChunkAt - startedAt) / 1000,
+          );
+        }
+        state.activeSpans.delete(span);
         span.end();
       }
     },
   });
-}
-
-function buildMessages(systemPrompt, input) {
-  const messages = [];
-  if (systemPrompt) messages.push({ role: "system", content: systemPrompt });
-  if (typeof input === "string") messages.push({ role: "user", content: input });
-  else if (Array.isArray(input)) messages.push(...input);
-  else if (input && typeof input === "object") messages.push(input);
-  return messages;
-}
-
-function readContextWindow(session) {
-  return session.contextWindow ?? session.inputQuota ?? session.maxTokens ?? 0;
-}
-
-function readContextUsage(session) {
-  return session.contextUsage ?? session.inputUsage ?? session.tokensSoFar ?? 0;
-}
-
-function contextAttrs(session, usage) {
-  return {
-    "session.context_window": readContextWindow(session),
-    "session.context_usage": Math.max(0, Math.round(usage)),
-  };
-}
-
-function tokenAttrs(before, after) {
-  const total = Math.max(0, Math.round(after));
-  const delta = Math.max(0, Math.round(after - before));
-  return {
-    [OI.LLM_TOKEN_TOTAL]: total,
-    [OI.LLM_TOKEN_PROMPT]: Math.max(0, Math.round(before)),
-    [OI.LLM_TOKEN_COMPLETION]: delta,
-  };
 }
