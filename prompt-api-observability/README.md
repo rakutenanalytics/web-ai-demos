@@ -1,6 +1,6 @@
 # Prompt API Observability
 
-Observability PoC for the [Prompt API](https://webmachinelearning.github.io/prompt-api/) — a standalone demo based on [`prompt-api-playground`](https://chrome.dev/web-ai-demos/prompt-api-playground/).
+Observability PoC for the [Prompt API](https://webmachinelearning.github.io/prompt-api/) — a standalone demo based on `[prompt-api-playground](https://chrome.dev/web-ai-demos/prompt-api-playground/)`.
 
 The Prompt API lets web apps call on-device language models directly from JavaScript (`LanguageModel.create`, `prompt`, `promptStreaming`, …). Implementations are available in browsers today; the API is being developed as an open web standard. This demo shows how to instrument those client-side calls and export traces to a local observability backend.
 
@@ -16,11 +16,13 @@ A copy of the Prompt API playground with a thin OpenTelemetry layer added. The c
 
 ### Changes vs prompt-api-playground
 
+
 | File           | Role                                                                                                        |
 | -------------- | ----------------------------------------------------------------------------------------------------------- |
 | `telemetry.js` | OpenTelemetry setup, MLflow OTLP export (`localhost:5000`, experiment `0`), Prompt API span instrumentation |
 | `script.js`    | Wires telemetry in; replaces `LanguageModel.create()` with `createInstrumentedSession()`                    |
 | `index.html`   | OpenTelemetry import map (SDK loaded from esm.sh)                                                           |
+
 
 Suggested review order: this README → `script.js` (diff vs playground) → `telemetry.js`.
 
@@ -30,6 +32,8 @@ Everything you may want to tweak sits in one block at the top of `telemetry.js`:
 
 - A browser with Prompt API support (e.g. Chrome with the built-in model enabled)
 - [uv](https://docs.astral.sh/uv/) (for `uvx mlflow server`) to run [MLflow](https://mlflow.org/)
+
+
 
 ## Run the demo
 
@@ -42,7 +46,7 @@ cd prompt-api-observability
 npm run mlflow
 ```
 
-Opens the MLflow UI at http://localhost:5000. MLflow's OTLP endpoint [recognises `gen_ai.*` attributes natively](https://mlflow.org/docs/latest/genai/tracing/opentelemetry/genai-semconv/), so no collector is needed.
+Opens the MLflow UI at [http://localhost:5000](http://localhost:5000). MLflow's OTLP endpoint [recognises](https://mlflow.org/docs/latest/genai/tracing/opentelemetry/genai-semconv/) `gen_ai.*` [attributes natively](https://mlflow.org/docs/latest/genai/tracing/opentelemetry/genai-semconv/), so no collector is needed.
 
 **Terminal 2 — playground**
 
@@ -51,7 +55,7 @@ cd prompt-api-observability
 npm start
 ```
 
-`npm start` generates a [DevTools Workspace](https://developer.chrome.com/docs/devtools/workspaces) mapping (`.well-known/appspecific/com.chrome.devtools.json`, gitignored), then serves the app at http://localhost:8080.
+`npm start` generates a [DevTools Workspace](https://developer.chrome.com/docs/devtools/workspaces) mapping (`.well-known/appspecific/com.chrome.devtools.json`, gitignored), then serves the app at [http://localhost:8080](http://localhost:8080).
 
 Submit a prompt in the browser. Traces appear in MLflow → **Default** experiment (ID `0`) → **Traces** tab.
 
@@ -64,7 +68,10 @@ await initTelemetry({
 });
 ```
 
+
+
 ## What gets traced
+
 
 | Span                     | Kind     | GenAI inference span | When          |
 | ------------------------ | -------- | -------------------- | ------------- |
@@ -72,13 +79,28 @@ await initTelemetry({
 | `generate_content`       | INTERNAL | **Yes**              | Each prompt   |
 | `web_ai.destroy_session` | INTERNAL | No                   | Session reset |
 
+
 Only `prompt()` and `promptStreaming()` generate content, so only they carry `gen_ai.operation.name`. Span kind is `INTERNAL` because the model runs in the same process — the convention reserves `CLIENT` for calls crossing a process boundary and explicitly allows `INTERNAL` for in-process models.
 
 ### Attributes
 
-**Resource vs span (OTel).** Stable for the page load → OTel **resource** (MLflow **trace tags**): `service.name`, `browser.*`, `user_agent.original`, `web_ai.runtime.{browser.name,browser.version,device_memory_gib}`. Changes per prompt or span → **span attributes**: `gen_ai.*`, per-turn `web_ai.context.*`, `web_ai.conversation.turn_index`, etc. Session-stable Prompt API options (`web_ai.context.window_tokens`, `gen_ai.system_instructions`, `web_ai.request.sampling_mode`, `web_ai.session.*`) live on `web_ai.create_session` only — not repeated on every `generate_content` span.
+**Resource vs span (OTel).** 
 
-**MLflow-only span attributes:** `mlflow.spanInputs` / `mlflow.spanOutputs` (OpenAI-shaped previews for the trace table). **`session.id` / `gen_ai.conversation.id`** on spans for session grouping (not resource — assigned per `LanguageModel.create()`).
+Stable for the page load → OTel **resource** (MLflow **trace tags**):
+
+ `service.name`, `browser.*`, `user_agent.original`, `web_ai.runtime.{browser.name,browser.version,device_memory_gib}`. 
+
+
+Changes per prompt or span → **span attributes**: 
+
+`gen_ai.*`, per-turn `web_ai.context.*`, `web_ai.conversation.turn_index`, etc. 
+
+
+Session-stable Prompt API options (`web_ai.context.window_tokens`, `gen_ai.system_instructions`, `web_ai.request.sampling_mode`, `web_ai.session.*`) live on `web_ai.create_session` only — not repeated on every `generate_content` span.
+
+**MLflow-only span attributes:** 
+
+`mlflow.spanInputs` / `mlflow.spanOutputs` (OpenAI-shaped previews for the trace table). `session.id` **/** `gen_ai.conversation.id` on spans for session grouping (not resource — assigned per `LanguageModel.create()`).
 
 Standard OTel GenAI, on each inference span:
 
@@ -90,26 +112,40 @@ Custom `web_ai.*` on inference spans: `usage_before_tokens`, `usage_after_tokens
 
 ### Notable choices
 
-**No model attributes.** The Prompt API exposes no model name or version, so `gen_ai.request.model` and `gen_ai.response.model` are unset and the span name is bare `generate_content` rather than the spec's `{operation} {model}`. The previous OpenInference version hardcoded `gemini-nano`, which was invented. The browser version is recorded separately as a resource attribute and never substituted for a model version.
+**No model attributes** 
+The Prompt API exposes no model name or version, so `gen_ai.request.model` and `gen_ai.response.model` are unset and the span name is bare `generate_content` rather than the spec's `{operation} {model}`. The previous OpenInference version hardcoded `gemini-nano`, which was invented. The browser version is recorded separately as a resource attribute and never substituted for a model version.
 
-**No token usage.** The Prompt API reports context-window measurements, not per-request token counts, so `gen_ai.usage.*` is unset and those measurements live under `web_ai.context.*`. The previous version derived `llm.token_count.*` from context deltas, which was wrong.
+**No token usage** 
+The Prompt API reports context-window measurements, not per-request token counts, so `gen_ai.usage.`* is unset and those measurements live under `web_ai.context.*`. The previous version derived `llm.token_count.*` from context deltas, which was wrong.
 
-**Messages are JSON strings.** OpenTelemetry JS has no structured attribute support — `AttributeValue` is a string, number, boolean or homogeneous array, and the SDK drops objects. The spec allows the fallback: _"When recorded on spans, it MAY be recorded as a JSON string if structured format is not supported."_ The JSON follows the GenAI [input](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/model/gen-ai/gen-ai-input-messages.json) / [output](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/model/gen-ai/gen-ai-output-messages.json) message schemas exactly.
+**Messages are JSON strings** 
+OpenTelemetry JS has no structured attribute support — `AttributeValue` is a string, number, boolean or homogeneous array, and the SDK drops objects. The spec allows the fallback: *"When recorded on spans, it MAY be recorded as a JSON string if structured format is not supported."* 
 
-**`session.id` vs `gen_ai.conversation.id`.** Both are assigned once per `LanguageModel.create()` and reused for every span on that session (create, prompts, destroy). A page reload or “Reset session” calls `createInstrumentedSession()` again and gets new ids. MLflow groups traces by `session.id`, so each Prompt API session is one MLflow conversation. By default `session.id` equals `gen_ai.conversation.id`; pass `telemetryOptions.sessionId` to override.
+The JSON follows the GenAI [input](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/model/gen-ai/gen-ai-input-messages.json) / [output](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/model/gen-ai/gen-ai-output-messages.json) message schemas exactly.
 
-**Session Input preview.** MLflow's session Input column comes from the first trace (`web_ai.create_session`), which has no user message. `mlflow.spanInputs` on that span carries the system prompt (OpenAI-shaped, `role: system`) so the session list shows it instead of an empty cell.
+`session.id` **vs** `gen_ai.conversation.id`
+Both are assigned once per `LanguageModel.create()` and reused for every span on that session (create, prompts, destroy). A page reload or “Reset session” calls `createInstrumentedSession()` again and gets new ids. MLflow groups traces by `session.id`, so each Prompt API session is one MLflow conversation. By default `session.id` equals `gen_ai.conversation.id`; pass `telemetryOptions.sessionId` to override.
 
-**Context overflow.** When the Prompt API compacts history (`contextoverflow` / `quotaoverflow`, or `contextUsage` drops vs `usage_before_tokens`), the in-flight `generate_content` span gets a `web_ai.context_overflow` event (with usage attributes — MLflow's Events tab only renders events that carry attributes), plus `web_ai.context.overflowed = true` and `gen_ai.conversation.compacted = true` on later turns.
+**Session Input preview** 
 
-**Privacy.** `CAPTURE_CONTENT = false` keeps prompts and responses out of spans. Image and audio parts are never exported as bytes in either mode; they become `{ "type": "redacted", "modality": "image" }`.
+MLflow's session Input column comes from the first trace (`web_ai.create_session`), which has no user message. `mlflow.spanInputs` on that span carries the system prompt (OpenAI-shaped, `role: system`) so the session list shows it instead of an empty cell.
+
+**Context overflow** 
+
+When the Prompt API compacts history (`contextoverflow` / `quotaoverflow`, or `contextUsage` drops vs `usage_before_tokens`), the in-flight `generate_content` span gets a `web_ai.context_overflow` event (with usage attributes — MLflow's Events tab only renders events that carry attributes), plus `web_ai.context.overflowed = true` and `gen_ai.conversation.compacted = true` on later turns.
+
+**Privacy** 
+
+`CAPTURE_CONTENT = false` keeps prompts and responses out of spans. Image and audio parts are never exported as bytes in either mode; they become `{ "type": "redacted", "modality": "image" }`.
 
 ### Not covered
 
-`clone()` and `append()` are passed through untraced. Consumers that break out of a streaming loop early still export the span, but via the underlying stream draining rather than an explicit cancellation path. Spec revision: [`67dff02`](https://github.com/open-telemetry/semantic-conventions-genai/commit/67dff024110be5bd9f318006e733f4078e0f4c97) (2026-08-27).
+`clone()` and `append()` are passed through untraced. Consumers that break out of a streaming loop early still export the span, but via the underlying stream draining rather than an explicit cancellation path. Spec revision: `[67dff02](https://github.com/open-telemetry/semantic-conventions-genai/commit/67dff024110be5bd9f318006e733f4078e0f4c97)` (2026-08-27).
 
 > [!WARNING]
 > Every `gen_ai.*` attribute used here, plus the `browser.*` and `session.id` conventions, is marked **Development** upstream and may change without a major version bump.
+
+
 
 ## Future work
 
