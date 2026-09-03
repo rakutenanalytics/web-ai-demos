@@ -188,12 +188,12 @@ const SYSTEM_PROMPT = "You are a helpful and friendly assistant.";
     promptInput.focus();
   };
 
-  resetButton.addEventListener("click", () => {
+  resetButton.addEventListener("click", async () => {
     promptInput.value = "";
     resetUI();
     session.destroy();
     session = null;
-    updateSession();
+    await updateSession();
   });
 
   copyLinkButton.addEventListener("click", () => {

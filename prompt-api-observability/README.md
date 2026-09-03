@@ -76,13 +76,17 @@ Only `prompt()` and `promptStreaming()` generate content, so only they carry `ge
 
 ### Attributes
 
+**Resource vs span (OTel).** Stable for the page load → OTel **resource** (MLflow **trace tags**): `service.name`, `browser.*`, `user_agent.original`, `web_ai.runtime.{browser.name,browser.version,device_memory_gib}`. Changes per prompt or span → **span attributes**: `gen_ai.*`, per-turn `web_ai.context.*`, `web_ai.conversation.turn_index`, etc. Session-stable Prompt API options (`web_ai.context.window_tokens`, `gen_ai.system_instructions`, `web_ai.request.sampling_mode`, `web_ai.session.*`) live on `web_ai.create_session` only — not repeated on every `generate_content` span.
+
+**MLflow-only span attributes:** `mlflow.spanInputs` / `mlflow.spanOutputs` (OpenAI-shaped previews for the trace table). **`session.id` / `gen_ai.conversation.id`** on spans for session grouping (not resource — assigned per `LanguageModel.create()`).
+
 Standard OTel GenAI, on each inference span:
 
 `gen_ai.operation.name` (`generate_content`), `gen_ai.provider.name` (`google.chrome`), `gen_ai.conversation.id`, `session.id`, `gen_ai.response.finish_reasons`, and when applicable `gen_ai.request.stream`, `gen_ai.output.type`, `gen_ai.response.time_to_first_chunk` (seconds), `gen_ai.conversation.compacted`, `error.type`.
 
-With `CAPTURE_CONTENT = true`: `gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.system_instructions`.
+With `CAPTURE_CONTENT = true`: `gen_ai.input.messages`, `gen_ai.output.messages`, plus `mlflow.spanInputs` / `mlflow.spanOutputs` for readable Request/Response columns (`gen_ai.system_instructions` only on `web_ai.create_session`).
 
-Custom `web_ai.*` for Prompt API concepts no convention covers: `web_ai.context.window_tokens`, `usage_before_tokens`, `usage_after_tokens`, `usage_delta_tokens`, `remaining_after_tokens`, `utilization_after`, `overflowed`, plus `web_ai.stream.chunk_count`, `web_ai.conversation.turn_index`, `web_ai.request.sampling_mode`, and `web_ai.runtime.browser.{name,version}` on the resource.
+Custom `web_ai.*` on inference spans: `usage_before_tokens`, `usage_after_tokens`, `usage_delta_tokens`, `remaining_after_tokens`, `utilization_after`, `overflowed`, `web_ai.stream.chunk_count`, `web_ai.conversation.turn_index`. On `web_ai.create_session`: `web_ai.context.window_tokens`, `gen_ai.system_instructions`, `web_ai.request.sampling_mode`, `web_ai.session.{expected_inputs,expected_outputs}`.
 
 ### Notable choices
 
@@ -92,9 +96,11 @@ Custom `web_ai.*` for Prompt API concepts no convention covers: `web_ai.context.
 
 **Messages are JSON strings.** OpenTelemetry JS has no structured attribute support — `AttributeValue` is a string, number, boolean or homogeneous array, and the SDK drops objects. The spec allows the fallback: _"When recorded on spans, it MAY be recorded as a JSON string if structured format is not supported."_ The JSON follows the GenAI [input](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/model/gen-ai/gen-ai-input-messages.json) / [output](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/model/gen-ai/gen-ai-output-messages.json) message schemas exactly.
 
-**`session.id` vs `gen_ai.conversation.id`.** `gen_ai.conversation.id` is one UUID per `LanguageModel` session, reused for every turn on it. `session.id` groups all conversations in one browser application session and lives in `sessionStorage`. The convention warns instrumentations not to invent a conversation id, but that targets libraries fabricating one per operation; here the application assigns it once at the real conversation boundary, which the same paragraph permits.
+**`session.id` vs `gen_ai.conversation.id`.** Both are assigned once per `LanguageModel.create()` and reused for every span on that session (create, prompts, destroy). A page reload or “Reset session” calls `createInstrumentedSession()` again and gets new ids. MLflow groups traces by `session.id`, so each Prompt API session is one MLflow conversation. By default `session.id` equals `gen_ai.conversation.id`; pass `telemetryOptions.sessionId` to override.
 
-**Context overflow.** When the Prompt API fires `contextoverflow`, the in-flight span gets a `web_ai.context_overflow` event, `web_ai.context.overflowed = true`, and `gen_ai.conversation.compacted = true` — which then stays set for later turns, since they all run against a compacted view. It is never set to `false`, per the convention.
+**Session Input preview.** MLflow's session Input column comes from the first trace (`web_ai.create_session`), which has no user message. `mlflow.spanInputs` on that span carries the system prompt (OpenAI-shaped, `role: system`) so the session list shows it instead of an empty cell.
+
+**Context overflow.** When the Prompt API compacts history (`contextoverflow` / `quotaoverflow`, or `contextUsage` drops vs `usage_before_tokens`), the in-flight `generate_content` span gets a `web_ai.context_overflow` event (with usage attributes — MLflow's Events tab only renders events that carry attributes), plus `web_ai.context.overflowed = true` and `gen_ai.conversation.compacted = true` on later turns.
 
 **Privacy.** `CAPTURE_CONTENT = false` keeps prompts and responses out of spans. Image and audio parts are never exported as bytes in either mode; they become `{ "type": "redacted", "modality": "image" }`.
 

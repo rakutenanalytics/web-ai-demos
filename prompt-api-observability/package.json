@@ -4,7 +4,7 @@
   "description": "Observability PoC for the Prompt API — browser-side OpenTelemetry GenAI tracing to MLflow.",
   "scripts": {
     "start": "npx devtools-json-generator . && npx http-server",
-    "mlflow": "uvx mlflow server",
+    "mlflow": "uvx --with 'anyio>=3.7,<4' mlflow server",
     "fix": "prettier --write ."
   },
   "author": "Julien Bataille (Rakuten Group, Inc.)",

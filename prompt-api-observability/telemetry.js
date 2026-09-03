@@ -60,6 +60,8 @@ const GEN_AI = {
 const WEB_AI = {
   BROWSER_NAME: "web_ai.runtime.browser.name",
   BROWSER_VERSION: "web_ai.runtime.browser.version",
+  /** Coarse RAM hint from the Device Memory API (`navigator.deviceMemory`), in GiB. */
+  DEVICE_MEMORY_GIB: "web_ai.runtime.device_memory_gib",
   CONTEXT_WINDOW: "web_ai.context.window_tokens",
   CONTEXT_USAGE_BEFORE: "web_ai.context.usage_before_tokens",
   CONTEXT_USAGE_AFTER: "web_ai.context.usage_after_tokens",
@@ -70,10 +72,21 @@ const WEB_AI = {
   CHUNK_COUNT: "web_ai.stream.chunk_count",
   TURN_INDEX: "web_ai.conversation.turn_index",
   SAMPLING_MODE: "web_ai.request.sampling_mode",
+  SESSION_EXPECTED_INPUTS: "web_ai.session.expected_inputs",
+  SESSION_EXPECTED_OUTPUTS: "web_ai.session.expected_outputs",
 };
 
 const ERROR_TYPE = "error.type";
 const SESSION_ID = "session.id";
+
+/**
+ * MLflow's trace-table preview (mlflow/tracing/utils/truncation.py) understands
+ * OpenAI-shaped `{messages: [{role, content}]}` on mlflow.spanInputs/Outputs,
+ * not GenAI `parts` arrays. Set these alongside gen_ai.* so the Response column
+ * shows plain text; span detail still uses the GenAI attributes.
+ */
+const MLFLOW_INPUTS = "mlflow.spanInputs";
+const MLFLOW_OUTPUTS = "mlflow.spanOutputs";
 
 /**
  * The spec's span name is `{operation} {request.model}`, but the Prompt API
@@ -89,23 +102,8 @@ const TRACER_VERSION = "0.2.0";
 let currentProvider = null;
 let tracer = trace.getTracer(TRACER_NAME, TRACER_VERSION);
 
-/**
- * Groups every trace from this browser application session, across all
- * conversations. In sessionStorage so a reload keeps it and a new tab gets a
- * new one.
- */
-const applicationSessionId = (() => {
-  const key = "web-ai.session.id";
-  try {
-    const existing = sessionStorage.getItem(key);
-    if (existing) return existing;
-    const created = crypto.randomUUID();
-    sessionStorage.setItem(key, created);
-    return created;
-  } catch {
-    return crypto.randomUUID();
-  }
-})();
+/** Spans that already received overflow event/attrs (listener + reconcile may both run). */
+const overflowRecordedSpans = new WeakSet();
 
 // --- Setup -----------------------------------------------------------------
 
@@ -120,16 +118,20 @@ const pickBrand = (brands = []) => {
 };
 
 /**
- * The browser is the Prompt API runtime — it supplies the model and dominates
- * performance — so record its identity on every trace. Low-entropy hints ride
- * on every request already via `Sec-CH-UA*`; `getHighEntropyValues()` adds a
- * little fingerprinting surface in exchange for a full patch version.
+ * Stable runtime identity for the page load. OTel resource attributes; MLflow
+ * stores them as trace tags (not span attributes). Per-prompt data stays on spans.
  */
 async function browserResourceAttributes() {
   const attributes = {
     "browser.language": navigator.language,
     "user_agent.original": navigator.userAgent,
   };
+
+  const deviceMemory = navigator.deviceMemory;
+  if (Number.isFinite(deviceMemory)) {
+    attributes[WEB_AI.DEVICE_MEMORY_GIB] = deviceMemory;
+  }
+
   const uaData = navigator.userAgentData;
   // No UA Client Hints: don't regex the UA string, and per the convention don't
   // fall back to the legacy navigator.platform.
@@ -248,6 +250,41 @@ const encodeOutputMessages = (text, finishReason) => [
   },
 ];
 
+/** Flatten GenAI message parts to plain text for MLflow list previews. */
+function textFromGenAiMessages(messages) {
+  const lines = [];
+  for (const message of messages) {
+    for (const part of message.parts ?? []) {
+      if (part.type === "text" && part.content) lines.push(part.content);
+    }
+  }
+  return lines.join("\n");
+}
+
+/** OpenAI-shaped JSON for MLflow request/response preview columns. */
+function mlflowChatPreview(role, text) {
+  return JSON.stringify({ messages: [{ role, content: text }] });
+}
+
+/**
+ * MLflow session grouping: `session.id` / `gen_ai.conversation.id` on spans
+ * (not resource — ids are assigned per LanguageModel session).
+ */
+function mlflowSessionAttributes(conversationId, sessionId) {
+  return {
+    [GEN_AI.CONVERSATION_ID]: conversationId,
+    [SESSION_ID]: sessionId,
+  };
+}
+
+/** Plain text from GenAI system-instruction parts. */
+function textFromSystemInstructions(parts) {
+  return parts
+    .map((part) => (part.type === "text" ? part.content : ""))
+    .filter(Boolean)
+    .join("\n");
+}
+
 // --- Context measurements --------------------------------------------------
 
 /** `contextWindow` is current; `inputQuota` is the deprecated spelling. */
@@ -263,14 +300,11 @@ function readContextUsage(session) {
 }
 
 /**
- * The delta is signed on purpose: when context overflow drops earlier turns,
- * usage goes down, and that decrease is the interesting signal.
+ * Per-turn context measurements on inference spans. Window size is stable for
+ * the session and is recorded only on `web_ai.create_session`.
  */
 function contextAttributes(windowTokens, before, after) {
   const attributes = {};
-  if (windowTokens !== undefined) {
-    attributes[WEB_AI.CONTEXT_WINDOW] = windowTokens;
-  }
   if (before !== undefined) attributes[WEB_AI.CONTEXT_USAGE_BEFORE] = before;
   if (after === undefined) return attributes;
 
@@ -278,14 +312,70 @@ function contextAttributes(windowTokens, before, after) {
   if (before !== undefined) {
     attributes[WEB_AI.CONTEXT_USAGE_DELTA] = after - before;
   }
-  if (windowTokens) {
+  if (windowTokens !== undefined) {
     attributes[WEB_AI.CONTEXT_REMAINING_AFTER] = windowTokens - after;
     attributes[WEB_AI.CONTEXT_UTILIZATION_AFTER] = after / windowTokens;
   }
   return attributes;
 }
 
+/** GenAI system-instructions schema from Prompt API `initialPrompts`. */
+function encodeSystemInstructions(initialPrompts) {
+  const parts = [];
+  for (const message of initialPrompts) {
+    if (message.role !== "system") continue;
+    if (typeof message.content === "string") {
+      parts.push({ type: "text", content: message.content });
+    } else if (Array.isArray(message.content)) {
+      for (const part of message.content) {
+        if (part.type === "text") {
+          parts.push({
+            type: "text",
+            content: String(part.value ?? part.content),
+          });
+        }
+      }
+    }
+  }
+  return parts.length ? parts : undefined;
+}
+
 // --- Instrumentation -------------------------------------------------------
+
+/** `LanguageModel.create()` options for the web_ai.create_session span. */
+function createSessionAttributes(options = {}) {
+  const attributes = {};
+
+  if (options.expectedInputs?.length) {
+    attributes[WEB_AI.SESSION_EXPECTED_INPUTS] = JSON.stringify(
+      options.expectedInputs,
+    );
+  }
+  if (options.expectedOutputs?.length) {
+    attributes[WEB_AI.SESSION_EXPECTED_OUTPUTS] = JSON.stringify(
+      options.expectedOutputs,
+    );
+  }
+  if (options.samplingMode) {
+    attributes[WEB_AI.SAMPLING_MODE] = options.samplingMode;
+  }
+
+  if (CAPTURE_CONTENT && options.initialPrompts?.length) {
+    const instructions = encodeSystemInstructions(options.initialPrompts);
+    if (instructions) {
+      attributes[GEN_AI.SYSTEM_INSTRUCTIONS] = JSON.stringify(instructions);
+      const text = textFromSystemInstructions(instructions);
+      if (text) {
+        // Session Input preview uses the first trace (create_session); show the system
+        // prompt because there is no user message yet. role=system — MLflow looks for
+        // user first, then falls back to the last message in the preview JSON.
+        attributes[MLFLOW_INPUTS] = mlflowChatPreview("system", text);
+      }
+    }
+  }
+
+  return attributes;
+}
 
 /**
  * Creates a `LanguageModel` session and wraps it.
@@ -294,7 +384,7 @@ function contextAttributes(windowTokens, before, after) {
  * never forwarded to `LanguageModel.create()` and never reaches the model.
  *
  * @param {any} options Passed verbatim to `LanguageModel.create()`.
- * @param {{ conversationId?: string }} telemetryOptions
+ * @param {{ conversationId?: string, sessionId?: string }} telemetryOptions
  */
 export async function createInstrumentedSession(
   options = {},
@@ -306,16 +396,19 @@ export async function createInstrumentedSession(
    * never the trace id, never derived from prompt content.
    */
   const conversationId = telemetryOptions.conversationId ?? crypto.randomUUID();
-  const systemPrompt = options.initialPrompts?.find(
-    (p) => p.role === "system",
-  )?.content;
+  /**
+   * MLflow groups traces by `session.id` into one conversation. A new Prompt
+   * API session (`LanguageModel.create`) starts a new conversation, so assign
+   * a fresh id here — not persisted across reloads or reused across creates.
+   */
+  const sessionId = telemetryOptions.sessionId ?? conversationId;
 
   // Not a GenAI inference span: creating a session generates nothing.
   const span = tracer.startSpan("web_ai.create_session", {
     kind: SpanKind.INTERNAL,
     attributes: {
-      [GEN_AI.CONVERSATION_ID]: conversationId,
-      [SESSION_ID]: applicationSessionId,
+      ...mlflowSessionAttributes(conversationId, sessionId),
+      ...createSessionAttributes(options),
     },
   });
 
@@ -326,12 +419,15 @@ export async function createInstrumentedSession(
       span.setAttribute(WEB_AI.CONTEXT_WINDOW, windowTokens);
     }
     span.setStatus({ code: SpanStatusCode.OK });
-    return wrapSession(session, { conversationId, systemPrompt });
+    return wrapSession(session, { conversationId, sessionId });
   } catch (err) {
     recordError(span, err);
     throw err;
   } finally {
     span.end();
+    // BatchSpanProcessor may not export until the next interval; flush so
+    // create_session is visible in MLflow right after load or reset.
+    await flushTelemetry();
   }
 }
 
@@ -341,19 +437,25 @@ function wrapSession(session, meta) {
     turnIndex: 0,
     compacted: false,
     activeSpans: new Set(),
+    /** Turn that overflowed when no span was active (event fired after span.end). */
+    overflowTurnIndex: undefined,
+  };
+
+  const onContextOverflow = () => {
+    state.compacted = true;
+    if (state.activeSpans.size === 0) {
+      // Chrome may fire after the stream completes; attach on that turn's span in finally.
+      state.overflowTurnIndex = state.turnIndex;
+    }
+    // Event + attrs are recorded in reconcileContextOverflow (with usage details for MLflow UI).
   };
 
   // `contextoverflow` means the browser dropped earlier turns to fit the
   // window, which is what gen_ai.conversation.compacted describes. It stays
   // true for every later turn on this conversation.
-  session.addEventListener?.("contextoverflow", () => {
-    state.compacted = true;
-    for (const span of state.activeSpans) {
-      span.addEvent("web_ai.context_overflow");
-      span.setAttribute(WEB_AI.CONTEXT_OVERFLOWED, true);
-      span.setAttribute(GEN_AI.CONVERSATION_COMPACTED, true);
-    }
-  });
+  session.addEventListener?.("contextoverflow", onContextOverflow);
+  // Deprecated spelling still used in some extension builds.
+  session.addEventListener?.("quotaoverflow", onContextOverflow);
 
   return new Proxy(session, {
     get(target, prop) {
@@ -369,15 +471,14 @@ function wrapSession(session, meta) {
           try {
             return target.destroy();
           } finally {
-            tracer
-              .startSpan("web_ai.destroy_session", {
-                kind: SpanKind.INTERNAL,
-                attributes: {
-                  [GEN_AI.CONVERSATION_ID]: state.conversationId,
-                  [SESSION_ID]: applicationSessionId,
-                },
-              })
-              .end();
+            const destroySpan = tracer.startSpan("web_ai.destroy_session", {
+              kind: SpanKind.INTERNAL,
+              attributes: mlflowSessionAttributes(
+                state.conversationId,
+                state.sessionId,
+              ),
+            });
+            destroySpan.end();
           }
         };
       }
@@ -389,6 +490,45 @@ function wrapSession(session, meta) {
   });
 }
 
+/** Span event + attrs when the Prompt API compacts conversation history. */
+function recordContextOverflow(span, before, after) {
+  if (overflowRecordedSpans.has(span)) return;
+  overflowRecordedSpans.add(span);
+  const eventAttrs = {
+    [WEB_AI.CONTEXT_OVERFLOWED]: true,
+    [GEN_AI.CONVERSATION_COMPACTED]: true,
+  };
+  if (before !== undefined) eventAttrs[WEB_AI.CONTEXT_USAGE_BEFORE] = before;
+  if (after !== undefined) eventAttrs[WEB_AI.CONTEXT_USAGE_AFTER] = after;
+  if (before !== undefined && after !== undefined) {
+    eventAttrs[WEB_AI.CONTEXT_USAGE_DELTA] = after - before;
+  }
+  // MLflow's Events tab only renders events that carry attributes (empty events are stored but invisible).
+  span.addEvent("web_ai.context_overflow", eventAttrs);
+  span.setAttribute(WEB_AI.CONTEXT_OVERFLOWED, true);
+  span.setAttribute(GEN_AI.CONVERSATION_COMPACTED, true);
+}
+
+/**
+ * Overflow may fire after span.end (activeSpans empty). Reconcile in finally
+ * using the turn index and/or a usage drop (compaction freed tokens).
+ */
+function reconcileContextOverflow(span, state, turnIndex, before, after) {
+  const usageDropped =
+    before !== undefined && after !== undefined && after < before;
+
+  if (state.overflowTurnIndex === turnIndex) {
+    state.compacted = true;
+    recordContextOverflow(span, before, after);
+    state.overflowTurnIndex = undefined;
+    return;
+  }
+  if (usageDropped) {
+    state.compacted = true;
+    recordContextOverflow(span, before, after);
+  }
+}
+
 /** Attributes known before the model runs. Set at creation so samplers see them. */
 function requestAttributes(session, state, input, opts, streaming) {
   state.turnIndex += 1;
@@ -396,28 +536,23 @@ function requestAttributes(session, state, input, opts, streaming) {
   const attributes = {
     [GEN_AI.OPERATION_NAME]: OPERATION,
     [GEN_AI.PROVIDER_NAME]: PROVIDER_NAME,
-    [GEN_AI.CONVERSATION_ID]: state.conversationId,
-    [SESSION_ID]: applicationSessionId,
+    ...mlflowSessionAttributes(state.conversationId, state.sessionId),
     [WEB_AI.TURN_INDEX]: state.turnIndex,
   };
 
   if (streaming) attributes[GEN_AI.REQUEST_STREAM] = true;
   if (opts?.responseConstraint) attributes[GEN_AI.OUTPUT_TYPE] = "json";
-  if (session.samplingMode) {
-    attributes[WEB_AI.SAMPLING_MODE] = session.samplingMode;
-  }
   // Never written as false: the convention treats it as a positive indicator
   // only and requires it left unset otherwise.
   if (state.compacted) attributes[GEN_AI.CONVERSATION_COMPACTED] = true;
 
   if (CAPTURE_CONTENT) {
-    attributes[GEN_AI.INPUT_MESSAGES] = JSON.stringify(
-      encodeInputMessages(input),
-    );
-    if (state.systemPrompt) {
-      attributes[GEN_AI.SYSTEM_INSTRUCTIONS] = JSON.stringify([
-        { type: "text", content: state.systemPrompt },
-      ]);
+    const inputMessages = encodeInputMessages(input);
+    attributes[GEN_AI.INPUT_MESSAGES] = JSON.stringify(inputMessages);
+    const previewText =
+      typeof input === "string" ? input : textFromGenAiMessages(inputMessages);
+    if (previewText) {
+      attributes[MLFLOW_INPUTS] = mlflowChatPreview("user", previewText);
     }
   }
 
@@ -425,16 +560,33 @@ function requestAttributes(session, state, input, opts, streaming) {
 }
 
 /** Attributes known once the call settled. */
-function resultAttributes(session, state, windowTokens, before, text, finish) {
+function resultAttributes(
+  session,
+  state,
+  windowTokens,
+  before,
+  text,
+  finish,
+  after = readContextUsage(session),
+) {
   const attributes = {
-    ...contextAttributes(windowTokens, before, readContextUsage(session)),
+    ...contextAttributes(windowTokens, before, after),
     [GEN_AI.FINISH_REASONS]: [finish],
   };
   if (state.compacted) attributes[GEN_AI.CONVERSATION_COMPACTED] = true;
+  if (
+    before !== undefined &&
+    after !== undefined &&
+    after < before
+  ) {
+    attributes[WEB_AI.CONTEXT_OVERFLOWED] = true;
+    attributes[GEN_AI.CONVERSATION_COMPACTED] = true;
+  }
   if (CAPTURE_CONTENT && text !== undefined) {
     attributes[GEN_AI.OUTPUT_MESSAGES] = JSON.stringify(
       encodeOutputMessages(text, finish),
     );
+    attributes[MLFLOW_OUTPUTS] = mlflowChatPreview("assistant", text);
   }
   return attributes;
 }
@@ -463,6 +615,7 @@ async function tracedPrompt(session, state, input, opts) {
   const windowTokens = readContextWindow(session);
   const before = readContextUsage(session);
   const attributes = requestAttributes(session, state, input, opts, false);
+  const turnIndex = state.turnIndex;
 
   return tracer.startActiveSpan(
     OPERATION,
@@ -471,12 +624,16 @@ async function tracedPrompt(session, state, input, opts) {
       state.activeSpans.add(span);
       try {
         const text = await session.prompt(input, opts);
+        const after = readContextUsage(session);
+        reconcileContextOverflow(span, state, turnIndex, before, after);
         span.setAttributes(
-          resultAttributes(session, state, windowTokens, before, text, "stop"),
+          resultAttributes(session, state, windowTokens, before, text, "stop", after),
         );
         span.setStatus({ code: SpanStatusCode.OK });
         return text;
       } catch (err) {
+        const after = readContextUsage(session);
+        reconcileContextOverflow(span, state, turnIndex, before, after);
         span.setAttributes(
           // No text: the response never completed.
           resultAttributes(
@@ -486,6 +643,7 @@ async function tracedPrompt(session, state, input, opts) {
             before,
             undefined,
             finishReasonFor(err),
+            after,
           ),
         );
         recordError(span, err);
@@ -502,6 +660,7 @@ function tracedPromptStreaming(session, state, input, opts) {
   const windowTokens = readContextWindow(session);
   const before = readContextUsage(session);
   const attributes = requestAttributes(session, state, input, opts, true);
+  const turnIndex = state.turnIndex;
 
   const span = tracer.startSpan(
     OPERATION,
@@ -526,12 +685,16 @@ function tracedPromptStreaming(session, state, input, opts) {
           text += chunk;
           controller.enqueue(chunk);
         }
+        const after = readContextUsage(session);
+        reconcileContextOverflow(span, state, turnIndex, before, after);
         span.setAttributes(
-          resultAttributes(session, state, windowTokens, before, text, "stop"),
+          resultAttributes(session, state, windowTokens, before, text, "stop", after),
         );
         span.setStatus({ code: SpanStatusCode.OK });
         controller.close();
       } catch (err) {
+        const after = readContextUsage(session);
+        reconcileContextOverflow(span, state, turnIndex, before, after);
         // Keep the partial text: seeing where generation stopped is the point.
         span.setAttributes(
           resultAttributes(
@@ -541,6 +704,7 @@ function tracedPromptStreaming(session, state, input, opts) {
             before,
             text,
             finishReasonFor(err),
+            after,
           ),
         );
         recordError(span, err);
