@@ -10,6 +10,223 @@ import { initTelemetry, createInstrumentedSession } from "./telemetry.js";
 
 const NUMBER_FORMAT_LANGUAGE = "en-US";
 const SYSTEM_PROMPT = "You are a helpful and friendly assistant.";
+const TOOL_SYSTEM_PROMPT =
+  "You are a helpful assistant. Answer questions by calling the tools you " +
+  "have when you need the current time or the weather in a city. Call every " +
+  "tool you need, then answer in one short sentence using only what the " +
+  "tools returned.";
+
+const MAX_TOOL_CALLS = 8;
+
+// Mock weather keyed by city. `get_weather` stamps each answer with the
+// current time so the model can relate conditions to "now".
+const WEATHER = {
+  tokyo: { tempC: 24, conditions: "clear" },
+  kyoto: { tempC: 22, conditions: "light rain" },
+  osaka: { tempC: 26, conditions: "cloudy" },
+};
+
+const tools = [
+  {
+    name: "get_current_time",
+    description:
+      "Get the current date and time in the user's locale and time zone.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
+    execute() {
+      const now = new Date();
+      return Promise.resolve({
+        iso: now.toISOString(),
+        local: now.toLocaleString(),
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      });
+    },
+  },
+  {
+    name: "get_weather",
+    description:
+      "Get the current weather for a city at the present moment. Only " +
+      "Tokyo, Kyoto and Osaka are known.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        city: {
+          type: "string",
+          description: 'The city name, for example "Kyoto".',
+        },
+      },
+      required: ["city"],
+    },
+    execute({ city }) {
+      const now = new Date();
+      const key = String(city ?? "").toLowerCase();
+      const base = WEATHER[key];
+      if (!base) {
+        return Promise.reject(
+          new Error(`No weather for "${city}". Try Tokyo, Kyoto or Osaka.`),
+        );
+      }
+      return Promise.resolve({
+        city,
+        observedAt: now.toISOString(),
+        localTime: now.toLocaleString(),
+        tempC: base.tempC,
+        conditions: base.conditions,
+      });
+    },
+  },
+];
+
+const declarations = tools.map(({ name, description, inputSchema }) => ({
+  name,
+  description,
+  inputSchema,
+}));
+const toolsByName = new Map(tools.map((tool) => [tool.name, tool]));
+
+function toolUseSupported() {
+  return (
+    "LanguageModelToolCall" in self &&
+    "LanguageModelToolSuccess" in self &&
+    "LanguageModelToolError" in self
+  );
+}
+
+// Chrome rejects a tool result that contains a JSON null anywhere inside it.
+function withoutNulls(value) {
+  if (Array.isArray(value)) {
+    return value
+      .filter((item) => item !== null && item !== undefined)
+      .map(withoutNulls);
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([, item]) => item !== null && item !== undefined)
+        .map(([key, item]) => [key, withoutNulls(item)]),
+    );
+  }
+  return value;
+}
+
+function missingArguments(tool, args) {
+  const required = tool.inputSchema?.required ?? [];
+  return required.filter((key) => {
+    const value = args?.[key];
+    if (Array.isArray(value)) {
+      return value.length === 0;
+    }
+    return value === undefined || value === null || value === "";
+  });
+}
+
+async function runTool(name, args) {
+  const tool = toolsByName.get(name);
+  if (!tool) {
+    return {
+      ok: false,
+      message: `There is no tool named ${name}.`,
+    };
+  }
+
+  const missing = missingArguments(tool, args);
+  if (missing.length) {
+    const list = missing.map((key) => `"${key}"`).join(" and ");
+    return {
+      ok: false,
+      message:
+        `${name} was called without ${list}. Call it again and provide ` +
+        `${missing.length > 1 ? "those arguments" : "that argument"}.`,
+    };
+  }
+
+  try {
+    const value = await tool.execute(args ?? {});
+    return { ok: true, value };
+  } catch (error) {
+    return { ok: false, message: String(error) };
+  }
+}
+
+function toolResponsePart(call, outcome) {
+  const value = outcome.ok
+    ? new LanguageModelToolSuccess({
+        callID: call.callID,
+        name: call.name,
+        result: [{ type: "object", value: withoutNulls(outcome.value) ?? {} }],
+      })
+    : new LanguageModelToolError({
+        callID: call.callID,
+        name: call.name,
+        errorMessage: outcome.message,
+      });
+  return { type: "tool-response", value };
+}
+
+/**
+ * Streams one model turn. Text chunks are passed to `onText` when provided;
+ * tool-call chunks are collected for the caller to run.
+ */
+async function streamTurn(input, onText) {
+  const calls = [];
+  let text = "";
+  let previousChunk = "";
+
+  for await (const chunk of session.promptStreaming(input)) {
+    if (typeof chunk !== "string") {
+      if (chunk?.type === "tool-call") {
+        calls.push(chunk.value);
+      }
+      continue;
+    }
+
+    const newChunk = chunk.startsWith(previousChunk)
+      ? chunk.slice(previousChunk.length)
+      : chunk;
+    text += newChunk;
+    previousChunk = chunk;
+    onText?.(text);
+  }
+
+  return { calls, text };
+}
+
+/**
+ * Runs the tool loop until the model answers with text. Tool calls happen
+ * silently: the UI only sees the final streamed answer, same as a plain turn.
+ */
+async function promptWithTools(prompt, onText) {
+  let { calls, text } = await streamTurn(prompt);
+
+  if (!calls.length) {
+    onText(text);
+    return text;
+  }
+
+  let rounds = 0;
+  while (calls.length) {
+    if (++rounds > MAX_TOOL_CALLS) {
+      throw new Error(
+        `Stopped after ${MAX_TOOL_CALLS} tool calls without a final answer.`,
+      );
+    }
+
+    const responses = [];
+    for (const call of calls) {
+      const outcome = await runTool(call.name, call.arguments);
+      responses.push(toolResponsePart(call, outcome));
+    }
+
+    ({ calls, text } = await streamTurn(
+      [{ role: "user", content: responses }],
+      onText,
+    ));
+  }
+
+  return text;
+}
 
 (async () => {
   const errorMessage = document.getElementById("error-message");
@@ -32,6 +249,7 @@ const SYSTEM_PROMPT = "You are a helpful and friendly assistant.";
   responseArea.style.display = "none";
 
   let session = null;
+  const toolsEnabled = toolUseSupported();
 
   if (!("LanguageModel" in self)) {
     errorMessage.style.display = "block";
@@ -59,23 +277,30 @@ const SYSTEM_PROMPT = "You are a helpful and friendly assistant.";
     p.textContent = "Generating response...";
     responseArea.append(p);
 
+    const renderText = (text) => {
+      p.innerHTML = DOMPurify.sanitize(marked.parse(text));
+      rawResponse.innerText = text;
+    };
+
     try {
       if (!session) {
         await updateSession();
         updateStats();
       }
-      const stream = await session.promptStreaming(prompt);
 
-      let result = "";
-      let previousChunk = "";
-      for await (const chunk of stream) {
-        const newChunk = chunk.startsWith(previousChunk)
-          ? chunk.slice(previousChunk.length)
-          : chunk;
-        result += newChunk;
-        p.innerHTML = DOMPurify.sanitize(marked.parse(result));
-        rawResponse.innerText = result;
-        previousChunk = chunk;
+      if (toolsEnabled) {
+        await promptWithTools(prompt, renderText);
+      } else {
+        let result = "";
+        let previousChunk = "";
+        for await (const chunk of session.promptStreaming(prompt)) {
+          const newChunk = chunk.startsWith(previousChunk)
+            ? chunk.slice(previousChunk.length)
+            : chunk;
+          result += newChunk;
+          renderText(result);
+          previousChunk = chunk;
+        }
       }
     } catch (error) {
       p.textContent = `Error: ${error.message}`;
@@ -219,22 +444,33 @@ const SYSTEM_PROMPT = "You are a helpful and friendly assistant.";
 
   const updateSession = async () => {
     if (self.LanguageModel) {
-      session = await createInstrumentedSession({
-        expectedInputs: [
-          {
-            type: "text",
-            languages: ["en" /* system prompt */, "en" /* user prompt */],
-          },
-        ],
-        expectedOutputs: [{ type: "text", languages: ["en"] }],
+      const options = {
+        expectedInputs: toolsEnabled
+          ? [
+              { type: "text", languages: ["en"] },
+              { type: "tool-response" },
+            ]
+          : [
+              {
+                type: "text",
+                languages: ["en" /* system prompt */, "en" /* user prompt */],
+              },
+            ],
+        expectedOutputs: toolsEnabled
+          ? [{ type: "text", languages: ["en"] }, { type: "tool-call" }]
+          : [{ type: "text", languages: ["en"] }],
         samplingMode: "creative",
         initialPrompts: [
           {
             role: "system",
-            content: SYSTEM_PROMPT,
+            content: toolsEnabled ? TOOL_SYSTEM_PROMPT : SYSTEM_PROMPT,
           },
         ],
-      });
+      };
+      if (toolsEnabled) {
+        options.tools = declarations;
+      }
+      session = await createInstrumentedSession(options);
     }
     resetUI();
     updateStats();
