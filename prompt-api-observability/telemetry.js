@@ -49,6 +49,11 @@ const GEN_AI = {
   FINISH_REASONS: "gen_ai.response.finish_reasons",
   CONVERSATION_ID: "gen_ai.conversation.id",
   CONVERSATION_COMPACTED: "gen_ai.conversation.compacted",
+  TOOL_DEFINITIONS: "gen_ai.tool.definitions",
+  TOOL_NAME: "gen_ai.tool.name",
+  TOOL_DESCRIPTION: "gen_ai.tool.description",
+  TOOL_TYPE: "gen_ai.tool.type",
+  TOOL_CALL_ID: "gen_ai.tool.call.id",
 };
 
 /**
@@ -74,6 +79,19 @@ const WEB_AI = {
   SAMPLING_MODE: "web_ai.request.sampling_mode",
   SESSION_EXPECTED_INPUTS: "web_ai.session.expected_inputs",
   SESSION_EXPECTED_OUTPUTS: "web_ai.session.expected_outputs",
+  TOOL_COUNT: "web_ai.tool.count",
+  TOOL_NAMES: "web_ai.tool.names",
+  TOOL_CALL_COUNT: "web_ai.tool.call_count",
+  TOOL_CALL_NAMES: "web_ai.tool.call_names",
+  TOOL_RESPONSE_COUNT: "web_ai.tool.response_count",
+  TOOL_CALL_INDEX: "web_ai.tool.call_index",
+  TOOL_CALL_ARGUMENTS: "web_ai.tool.call_arguments",
+  TOOL_RESULT: "web_ai.tool.result",
+  TOOL_FAILED: "web_ai.tool.failed",
+  TURN_CONTINUATION: "web_ai.conversation.turn_continuation",
+  EXCHANGE_TURN_COUNT: "web_ai.exchange.turn_count",
+  EXCHANGE_TOOL_CALL_COUNT: "web_ai.exchange.tool_call_count",
+  EXCHANGE_ABANDONED: "web_ai.exchange.abandoned",
 };
 
 const ERROR_TYPE = "error.type";
@@ -95,9 +113,15 @@ const MLFLOW_OUTPUTS = "mlflow.spanOutputs";
  * `gen_ai.usage.*` are never set below.
  */
 const OPERATION = "generate_content";
+const OPERATION_INVOKE_AGENT = "invoke_agent";
+const OPERATION_EXECUTE_TOOL = "execute_tool";
+const TOOL_TYPE_FUNCTION = "function";
+const FINISH_STOP = "stop";
+const FINISH_TOOL_CALL = "tool_call";
+const MAX_ATTRIBUTE_LENGTH = 8192;
 
 const TRACER_NAME = "prompt-api-observability";
-const TRACER_VERSION = "0.2.0";
+const TRACER_VERSION = "0.3.0";
 
 let currentProvider = null;
 let tracer = trace.getTracer(TRACER_NAME, TRACER_VERSION);
@@ -228,27 +252,163 @@ function encodeInputMessages(input) {
   }));
 }
 
+function truncateAttribute(value, max = MAX_ATTRIBUTE_LENGTH) {
+  if (value.length <= max) return value;
+  return `${value.slice(0, max)}...`;
+}
+
+// --- Tool traffic ----------------------------------------------------------
+
+/** Tool objects keep fields on the prototype; read each one by name. */
+function fieldsOf(value) {
+  if (value === null || typeof value !== "object") return;
+  return value;
+}
+
+function stringField(fields, key) {
+  const value = fields[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function readToolCall(value) {
+  const fields = fieldsOf(value);
+  const name = fields && stringField(fields, "name");
+  if (!(fields && name)) return;
+  return {
+    id: stringField(fields, "callID") ?? "",
+    name,
+    arguments: fields.arguments,
+  };
+}
+
+function readToolResult(value) {
+  if (!Array.isArray(value)) return value ?? undefined;
+  return value.map((entry) => {
+    const fields = fieldsOf(entry);
+    return fields ? { type: fields.type, value: fields.value } : entry;
+  });
+}
+
+function readToolResponse(value) {
+  const fields = fieldsOf(value);
+  const name = fields && stringField(fields, "name");
+  if (!(fields && name)) return;
+
+  const id = stringField(fields, "callID") ?? "";
+  const errorMessage = stringField(fields, "errorMessage");
+  if (errorMessage !== undefined) {
+    return { id, name, errorMessage };
+  }
+  return { id, name, result: readToolResult(fields.result) };
+}
+
+function toolCallFromChunk(chunk) {
+  const fields = fieldsOf(chunk);
+  if (fields?.type !== "tool-call") return;
+  return readToolCall(fields.value);
+}
+
+function collectToolPart(part, traffic) {
+  const fields = fieldsOf(part);
+  if (!fields) return;
+  if (fields.type === "tool-call") {
+    const call = readToolCall(fields.value);
+    if (call) traffic.calls.push(call);
+    return;
+  }
+  if (fields.type === "tool-response") {
+    const response = readToolResponse(fields.value);
+    if (response) traffic.responses.push(response);
+  }
+}
+
+function toolTrafficFrom(input) {
+  const traffic = { calls: [], responses: [] };
+  if (typeof input === "string" || !input) return traffic;
+
+  const messages = Array.isArray(input) ? input : [input];
+  for (const message of messages) {
+    const content = fieldsOf(message)?.content;
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      collectToolPart(part, traffic);
+    }
+  }
+  return traffic;
+}
+
+function readAssistantTurn(output) {
+  if (typeof output === "string") {
+    return { text: output, toolCalls: [] };
+  }
+  if (!Array.isArray(output)) {
+    return { text: "", toolCalls: [] };
+  }
+
+  const turn = { text: "", toolCalls: [] };
+  for (const part of output) {
+    const fields = fieldsOf(part);
+    if (!fields) continue;
+    if (fields.type === "text") {
+      turn.text += String(fields.value ?? "");
+      continue;
+    }
+    const call = toolCallFromChunk(fields);
+    if (call) turn.toolCalls.push(call);
+  }
+  return turn;
+}
+
+function toolCallPart(call) {
+  const part = { type: "tool_call", name: call.name };
+  if (call.id) part.id = call.id;
+  if (call.arguments !== undefined) part.arguments = call.arguments;
+  return part;
+}
+
+function toolResponsePartEncoded(response) {
+  const part = { type: "tool_call_response", name: response.name };
+  if (response.id) part.id = response.id;
+  if (response.errorMessage === undefined) {
+    part.response = response.result;
+  } else {
+    part.error = response.errorMessage;
+  }
+  return part;
+}
+
+function encodePart(part) {
+  if (part.type === "text") {
+    return { type: "text", content: String(part.value) };
+  }
+  if (part.type === "tool-call") {
+    const call = readToolCall(part.value);
+    if (call) return toolCallPart(call);
+  }
+  if (part.type === "tool-response") {
+    const response = readToolResponse(part.value);
+    if (response) return toolResponsePartEncoded(response);
+  }
+  return { type: "redacted", modality: part.type };
+}
+
 function encodeParts(content) {
   if (typeof content === "string") return [{ type: "text", content }];
   if (!Array.isArray(content)) return [];
-
-  return content.map((part) =>
-    part.type === "text"
-      ? { type: "text", content: String(part.value) }
-      : // Never export image or audio bytes. This is a GenericPart, which needs
-        // only `type`; a BlobPart would require inline base64 content.
-        { type: "redacted", modality: part.type },
-  );
+  return content.map(encodePart);
 }
 
 /** `finish_reason` is required by the output message schema. */
-const encodeOutputMessages = (text, finishReason) => [
-  {
-    role: "assistant",
-    parts: [{ type: "text", content: text }],
-    finish_reason: finishReason,
-  },
-];
+function encodeOutputMessages(output, finishReason) {
+  const parts =
+    typeof output === "string"
+      ? [{ type: "text", content: output }]
+      : [
+          ...(output.text ? [{ type: "text", content: output.text }] : []),
+          ...output.toolCalls.map(toolCallPart),
+        ];
+  return [{ role: "assistant", parts, finish_reason: finishReason }];
+}
 
 /** Flatten GenAI message parts to plain text for MLflow list previews. */
 function textFromGenAiMessages(messages) {
@@ -340,6 +500,22 @@ function encodeSystemInstructions(initialPrompts) {
   return parts.length ? parts : undefined;
 }
 
+// --- Span timing -----------------------------------------------------------
+
+/**
+ * Epoch milliseconds for every timestamp this module sets by hand.
+ *
+ * Left alone, the SDK starts a span from `Date.now()`, which is whole
+ * milliseconds, and derives its end from the monotonic clock. That is enough
+ * for a span timed in one place, but an exchange is timed across several
+ * calls: at millisecond granularity a fast tool collapses into a zero-length
+ * span that starts on the same tick as the turn it precedes, and siblings
+ * sharing a start have no order left for a trace viewer to show. Taking every
+ * hand-set timestamp from the monotonic clock instead keeps a tool run
+ * sub-millisecond and strictly between the turns it sits between.
+ */
+const spanTimestamp = () => performance.timeOrigin + performance.now();
+
 // --- Instrumentation -------------------------------------------------------
 
 /** `LanguageModel.create()` options for the web_ai.create_session span. */
@@ -358,6 +534,23 @@ function createSessionAttributes(options = {}) {
   }
   if (options.samplingMode) {
     attributes[WEB_AI.SAMPLING_MODE] = options.samplingMode;
+  }
+
+  if (options.tools?.length) {
+    attributes[WEB_AI.TOOL_COUNT] = options.tools.length;
+    attributes[WEB_AI.TOOL_NAMES] = options.tools.map((tool) => tool.name);
+    if (CAPTURE_CONTENT) {
+      attributes[GEN_AI.TOOL_DEFINITIONS] = truncateAttribute(
+        JSON.stringify(
+          options.tools.map(({ name, description, inputSchema }) => ({
+            type: TOOL_TYPE_FUNCTION,
+            name,
+            description,
+            input_schema: inputSchema,
+          })),
+        ),
+      );
+    }
   }
 
   if (CAPTURE_CONTENT && options.initialPrompts?.length) {
@@ -419,7 +612,7 @@ export async function createInstrumentedSession(
       span.setAttribute(WEB_AI.CONTEXT_WINDOW, windowTokens);
     }
     span.setStatus({ code: SpanStatusCode.OK });
-    return wrapSession(session, { conversationId, sessionId });
+    return wrapSession(session, { conversationId, sessionId }, options);
   } catch (err) {
     recordError(span, err);
     throw err;
@@ -431,7 +624,187 @@ export async function createInstrumentedSession(
   }
 }
 
-function wrapSession(session, meta) {
+/**
+ * Remembers the calls a turn asked for, and hands each one an id.
+ *
+ * Chrome leaves `callID` empty, so a synthetic id is filled in: without one,
+ * nothing ties the `tool_call` part recorded on the turn to the `execute_tool`
+ * span that answers it. Calls are stamped with the moment the turn ended
+ * rather than the moment each appeared, because the page cannot act on a call
+ * until the stream closes — that wait belongs to the turn.
+ */
+function registerToolCalls(state, calls, parent, runnableAt) {
+  return calls.map((call) => {
+    state.toolCallSeq += 1;
+    const identified = {
+      ...call,
+      id: call.id || `${state.sessionId}-${state.toolCallSeq}`,
+    };
+    state.pendingCalls.push({
+      ...identified,
+      index: state.toolCallSeq,
+      turnIndex: state.turnIndex,
+      runnableAt,
+      parent,
+    });
+    return identified;
+  });
+}
+
+/**
+ * Finds the call a response answers. `callID` would say so, but Chrome leaves
+ * it empty on both sides, so the name is matched instead and same-named calls
+ * fall back to the order they were requested in.
+ */
+function takePendingCall(state, response) {
+  const { pendingCalls } = state;
+  const byId = response.id
+    ? pendingCalls.findIndex((call) => call.id === response.id)
+    : -1;
+  const at =
+    byId >= 0
+      ? byId
+      : pendingCalls.findIndex((call) => call.name === response.name);
+
+  // A response that matches nothing must not consume some other call's record,
+  // or the next response inherits its arguments and its start time.
+  if (at < 0) return;
+  return pendingCalls.splice(at, 1)[0];
+}
+
+function safeJson(value) {
+  try {
+    return truncateAttribute(JSON.stringify(value));
+  } catch {
+    return;
+  }
+}
+
+function toolSpanAttributes(state, response, pending) {
+  const name = response.name || pending?.name || "unknown";
+  const attributes = {
+    [GEN_AI.OPERATION_NAME]: OPERATION_EXECUTE_TOOL,
+    [GEN_AI.PROVIDER_NAME]: PROVIDER_NAME,
+    ...mlflowSessionAttributes(state.conversationId, state.sessionId),
+    [GEN_AI.TOOL_NAME]: name,
+    [GEN_AI.TOOL_TYPE]: TOOL_TYPE_FUNCTION,
+  };
+
+  // The response's own id when the model set one, otherwise the id handed to
+  // the call, which is what the turn's tool_call part carries.
+  const callId = response.id || pending?.id;
+  if (callId) attributes[GEN_AI.TOOL_CALL_ID] = callId;
+  if (pending) {
+    attributes[WEB_AI.TOOL_CALL_INDEX] = pending.index;
+    attributes[WEB_AI.TURN_INDEX] = pending.turnIndex;
+  }
+
+  const description = state.tools.get(name)?.description;
+  if (description) attributes[GEN_AI.TOOL_DESCRIPTION] = description;
+  if (CAPTURE_CONTENT && pending?.arguments !== undefined) {
+    attributes[WEB_AI.TOOL_CALL_ARGUMENTS] = safeJson(pending.arguments);
+  }
+  if (CAPTURE_CONTENT && response.result !== undefined) {
+    attributes[WEB_AI.TOOL_RESULT] = safeJson(response.result);
+  }
+  if (response.errorMessage !== undefined) {
+    attributes[WEB_AI.TOOL_FAILED] = true;
+  }
+
+  return attributes;
+}
+
+/**
+ * Emits one `execute_tool` span per response received, ending them all at
+ * `endTime` — the instant the turn that consumes them begins.
+ *
+ * The tool itself runs in page code this instrumentation never sees, so the
+ * span is reconstructed after the fact: it runs from the turn that asked for
+ * the call to the moment the page came back with a result. That covers the
+ * page's own tool loop as well as the tool, which is the wait a developer can
+ * actually act on.
+ */
+function emitToolExecutionSpans(state, responses, fallbackParent, endTime) {
+  for (const response of responses) {
+    const pending = takePendingCall(state, response);
+    const name = response.name || pending?.name || "unknown";
+
+    const span = tracer.startSpan(
+      `${OPERATION_EXECUTE_TOOL} ${name}`,
+      {
+        kind: SpanKind.INTERNAL,
+        // An unmatched response has no known start, so it collapses onto the
+        // moment it arrived rather than borrowing another call's clock.
+        startTime: pending?.runnableAt ?? endTime,
+        attributes: toolSpanAttributes(state, response, pending),
+      },
+      pending?.parent ?? fallbackParent,
+    );
+
+    if (response.errorMessage === undefined) {
+      span.setStatus({ code: SpanStatusCode.OK });
+    } else {
+      span.setAttribute(ERROR_TYPE, "ToolError");
+      span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: response.errorMessage,
+      });
+    }
+    span.end(endTime);
+  }
+}
+
+function exchangeAttributes(state, input) {
+  const attributes = {
+    [GEN_AI.OPERATION_NAME]: OPERATION_INVOKE_AGENT,
+    [GEN_AI.PROVIDER_NAME]: PROVIDER_NAME,
+    ...mlflowSessionAttributes(state.conversationId, state.sessionId),
+    [WEB_AI.TOOL_COUNT]: state.tools.size,
+    [WEB_AI.TOOL_NAMES]: [...state.tools.keys()],
+  };
+
+  if (CAPTURE_CONTENT) {
+    const inputMessages = encodeInputMessages(input);
+    attributes[GEN_AI.INPUT_MESSAGES] = truncateAttribute(
+      JSON.stringify(inputMessages),
+    );
+    const previewText =
+      typeof input === "string" ? input : textFromGenAiMessages(inputMessages);
+    if (previewText) {
+      attributes[MLFLOW_INPUTS] = mlflowChatPreview("user", previewText);
+    }
+  }
+
+  return attributes;
+}
+
+function exchangeResultAttributes(exchange, output) {
+  const attributes = {
+    [WEB_AI.EXCHANGE_TURN_COUNT]: exchange.turns,
+    [WEB_AI.EXCHANGE_TOOL_CALL_COUNT]: exchange.toolCalls,
+  };
+
+  if (output === undefined) {
+    attributes[WEB_AI.EXCHANGE_ABANDONED] = true;
+    return attributes;
+  }
+
+  attributes[GEN_AI.FINISH_REASONS] = [FINISH_STOP];
+  if (CAPTURE_CONTENT) {
+    const text = typeof output === "string" ? output : output.text;
+    attributes[GEN_AI.OUTPUT_MESSAGES] = truncateAttribute(
+      JSON.stringify(encodeOutputMessages(output, FINISH_STOP)),
+    );
+    if (text) {
+      attributes[MLFLOW_OUTPUTS] = mlflowChatPreview("assistant", text);
+    }
+  }
+
+  return attributes;
+}
+
+function wrapSession(session, meta, createOptions = {}) {
+  const tools = createOptions.tools ?? [];
   const state = {
     ...meta,
     turnIndex: 0,
@@ -439,6 +812,10 @@ function wrapSession(session, meta) {
     activeSpans: new Set(),
     /** Turn that overflowed when no span was active (event fired after span.end). */
     overflowTurnIndex: undefined,
+    tools: new Map(tools.map((tool) => [tool.name, tool])),
+    pendingCalls: [],
+    toolCallSeq: 0,
+    exchange: undefined,
   };
 
   const onContextOverflow = () => {
@@ -457,17 +834,91 @@ function wrapSession(session, meta) {
   // Deprecated spelling still used in some extension builds.
   session.addEventListener?.("quotaoverflow", onContextOverflow);
 
+  const closeExchange = (output, at) => {
+    const { exchange } = state;
+    if (!exchange) return;
+    state.exchange = undefined;
+    state.pendingCalls = [];
+    exchange.span.setAttributes(exchangeResultAttributes(exchange, output));
+    exchange.span.setStatus({ code: SpanStatusCode.OK });
+    // Ends where its last turn ended, so the root always covers its children.
+    exchange.span.end(at);
+  };
+
+  const openExchange = (input, startTime) => {
+    if (state.tools.size === 0) return;
+
+    const span = tracer.startSpan(
+      OPERATION_INVOKE_AGENT,
+      {
+        kind: SpanKind.INTERNAL,
+        startTime,
+        attributes: exchangeAttributes(state, input),
+      },
+      context.active(),
+    );
+    const spanContext = trace.setSpan(context.active(), span);
+    state.exchange = { span, context: spanContext, turns: 0, toolCalls: 0 };
+    return spanContext;
+  };
+
+  const beginTurn = (input) => {
+    const at = spanTimestamp();
+    const traffic = toolTrafficFrom(input);
+    const continuation =
+      traffic.responses.length > 0 && Boolean(state.exchange);
+
+    if (!continuation) closeExchange(undefined, at);
+
+    const parent =
+      (continuation ? state.exchange?.context : openExchange(input, at)) ??
+      context.active();
+
+    // Emitted before the turn opens so a tool run sits beside the turns rather
+    // than inside the one being told its result. Sharing `at` with the turn
+    // about to start is what keeps the two strictly ordered.
+    if (traffic.responses.length > 0) {
+      emitToolExecutionSpans(state, traffic.responses, parent, at);
+    }
+
+    if (state.exchange) state.exchange.turns += 1;
+
+    return { traffic, parent, startTime: at };
+  };
+
+  const settleTurn = (turn, at) => {
+    if (state.exchange && turn) {
+      state.exchange.toolCalls += turn.toolCalls.length;
+    }
+    if (!turn || turn.toolCalls.length === 0) {
+      closeExchange(turn, at);
+    }
+  };
+
+  const toolParent = (fallback) => state.exchange?.context ?? fallback;
+
   return new Proxy(session, {
     get(target, prop) {
       if (prop === "prompt") {
-        return (input, opts) => tracedPrompt(target, state, input, opts);
+        return (input, opts) =>
+          tracedPrompt(target, state, input, opts, {
+            beginTurn,
+            settleTurn,
+            toolParent,
+          });
       }
       if (prop === "promptStreaming") {
         return (input, opts) =>
-          tracedPromptStreaming(target, state, input, opts);
+          tracedPromptStreaming(target, state, input, opts, {
+            beginTurn,
+            settleTurn,
+            toolParent,
+          });
       }
       if (prop === "destroy") {
         return () => {
+          // Destroying mid-exchange means the tool results are never coming.
+          closeExchange(undefined, spanTimestamp());
           try {
             return target.destroy();
           } finally {
@@ -530,7 +981,7 @@ function reconcileContextOverflow(span, state, turnIndex, before, after) {
 }
 
 /** Attributes known before the model runs. Set at creation so samplers see them. */
-function requestAttributes(session, state, input, opts, streaming) {
+function requestAttributes(state, input, opts, streaming, traffic) {
   state.turnIndex += 1;
 
   const attributes = {
@@ -542,13 +993,17 @@ function requestAttributes(session, state, input, opts, streaming) {
 
   if (streaming) attributes[GEN_AI.REQUEST_STREAM] = true;
   if (opts?.responseConstraint) attributes[GEN_AI.OUTPUT_TYPE] = "json";
-  // Never written as false: the convention treats it as a positive indicator
-  // only and requires it left unset otherwise.
   if (state.compacted) attributes[GEN_AI.CONVERSATION_COMPACTED] = true;
+  if (traffic.responses.length > 0) {
+    attributes[WEB_AI.TURN_CONTINUATION] = true;
+    attributes[WEB_AI.TOOL_RESPONSE_COUNT] = traffic.responses.length;
+  }
 
   if (CAPTURE_CONTENT) {
     const inputMessages = encodeInputMessages(input);
-    attributes[GEN_AI.INPUT_MESSAGES] = JSON.stringify(inputMessages);
+    attributes[GEN_AI.INPUT_MESSAGES] = truncateAttribute(
+      JSON.stringify(inputMessages),
+    );
     const previewText =
       typeof input === "string" ? input : textFromGenAiMessages(inputMessages);
     if (previewText) {
@@ -559,13 +1014,23 @@ function requestAttributes(session, state, input, opts, streaming) {
   return attributes;
 }
 
+function toolCallAttributes(output) {
+  if (typeof output === "string" || output.toolCalls.length === 0) {
+    return {};
+  }
+  return {
+    [WEB_AI.TOOL_CALL_COUNT]: output.toolCalls.length,
+    [WEB_AI.TOOL_CALL_NAMES]: output.toolCalls.map((call) => call.name),
+  };
+}
+
 /** Attributes known once the call settled. */
 function resultAttributes(
   session,
   state,
   windowTokens,
   before,
-  text,
+  output,
   finish,
   after = readContextUsage(session),
 ) {
@@ -574,19 +1039,21 @@ function resultAttributes(
     [GEN_AI.FINISH_REASONS]: [finish],
   };
   if (state.compacted) attributes[GEN_AI.CONVERSATION_COMPACTED] = true;
-  if (
-    before !== undefined &&
-    after !== undefined &&
-    after < before
-  ) {
+  if (before !== undefined && after !== undefined && after < before) {
     attributes[WEB_AI.CONTEXT_OVERFLOWED] = true;
     attributes[GEN_AI.CONVERSATION_COMPACTED] = true;
   }
-  if (CAPTURE_CONTENT && text !== undefined) {
-    attributes[GEN_AI.OUTPUT_MESSAGES] = JSON.stringify(
-      encodeOutputMessages(text, finish),
+  if (output === undefined) return attributes;
+
+  Object.assign(attributes, toolCallAttributes(output));
+  if (CAPTURE_CONTENT) {
+    attributes[GEN_AI.OUTPUT_MESSAGES] = truncateAttribute(
+      JSON.stringify(encodeOutputMessages(output, finish)),
     );
-    attributes[MLFLOW_OUTPUTS] = mlflowChatPreview("assistant", text);
+    const text = typeof output === "string" ? output : output.text;
+    if (text) {
+      attributes[MLFLOW_OUTPUTS] = mlflowChatPreview("assistant", text);
+    }
   }
   return attributes;
 }
@@ -611,115 +1078,177 @@ const finishReasonFor = (err) =>
  */
 const SPAN_OPTIONS = { kind: SpanKind.INTERNAL };
 
-async function tracedPrompt(session, state, input, opts) {
+async function tracedPrompt(session, state, input, opts, exchange) {
+  const { traffic, parent, startTime } = exchange.beginTurn(input);
   const windowTokens = readContextWindow(session);
   const before = readContextUsage(session);
-  const attributes = requestAttributes(session, state, input, opts, false);
-  const turnIndex = state.turnIndex;
-
-  return tracer.startActiveSpan(
-    OPERATION,
-    { ...SPAN_OPTIONS, attributes },
-    async (span) => {
-      state.activeSpans.add(span);
-      try {
-        const text = await session.prompt(input, opts);
-        const after = readContextUsage(session);
-        reconcileContextOverflow(span, state, turnIndex, before, after);
-        span.setAttributes(
-          resultAttributes(session, state, windowTokens, before, text, "stop", after),
-        );
-        span.setStatus({ code: SpanStatusCode.OK });
-        return text;
-      } catch (err) {
-        const after = readContextUsage(session);
-        reconcileContextOverflow(span, state, turnIndex, before, after);
-        span.setAttributes(
-          // No text: the response never completed.
-          resultAttributes(
-            session,
-            state,
-            windowTokens,
-            before,
-            undefined,
-            finishReasonFor(err),
-            after,
-          ),
-        );
-        recordError(span, err);
-        throw err;
-      } finally {
-        state.activeSpans.delete(span);
-        span.end();
-      }
-    },
-  );
-}
-
-function tracedPromptStreaming(session, state, input, opts) {
-  const windowTokens = readContextWindow(session);
-  const before = readContextUsage(session);
-  const attributes = requestAttributes(session, state, input, opts, true);
+  const attributes = requestAttributes(state, input, opts, false, traffic);
   const turnIndex = state.turnIndex;
 
   const span = tracer.startSpan(
     OPERATION,
-    { ...SPAN_OPTIONS, attributes },
-    context.active(),
+    { ...SPAN_OPTIONS, startTime, attributes },
+    parent,
   );
+  const spanContext = trace.setSpan(parent, span);
+  state.activeSpans.add(span);
+
+  let turn;
+  let endedAt;
+  try {
+    return await context.with(spanContext, async () => {
+      const output = await session.prompt(input, opts);
+      endedAt = spanTimestamp();
+      const assistant = readAssistantTurn(output);
+      // Registered before the attributes are written so the turn's own
+      // tool_call parts carry the ids the tool spans will be labelled with.
+      turn = {
+        text: assistant.text,
+        toolCalls: registerToolCalls(
+          state,
+          assistant.toolCalls,
+          exchange.toolParent(spanContext),
+          endedAt,
+        ),
+      };
+      const after = readContextUsage(session);
+      reconcileContextOverflow(span, state, turnIndex, before, after);
+      span.setAttributes(
+        resultAttributes(
+          session,
+          state,
+          windowTokens,
+          before,
+          turn,
+          turn.toolCalls.length > 0 ? FINISH_TOOL_CALL : FINISH_STOP,
+          after,
+        ),
+      );
+      span.setStatus({ code: SpanStatusCode.OK });
+      return output;
+    });
+  } catch (err) {
+    const after = readContextUsage(session);
+    reconcileContextOverflow(span, state, turnIndex, before, after);
+    span.setAttributes(
+      resultAttributes(
+        session,
+        state,
+        windowTokens,
+        before,
+        undefined,
+        finishReasonFor(err),
+        after,
+      ),
+    );
+    recordError(span, err);
+    throw err;
+  } finally {
+    // Unset only when the turn failed before it could be timed.
+    endedAt ??= spanTimestamp();
+    state.activeSpans.delete(span);
+    span.end(endedAt);
+    exchange.settleTurn(turn, endedAt);
+  }
+}
+
+function tracedPromptStreaming(session, state, input, opts, exchange) {
+  const { traffic, parent, startTime } = exchange.beginTurn(input);
+  const windowTokens = readContextWindow(session);
+  const before = readContextUsage(session);
+  const attributes = requestAttributes(state, input, opts, true, traffic);
+  const turnIndex = state.turnIndex;
+
+  const span = tracer.startSpan(
+    OPERATION,
+    { ...SPAN_OPTIONS, startTime, attributes },
+    parent,
+  );
+  const spanContext = trace.setSpan(parent, span);
   state.activeSpans.add(span);
 
   const startedAt = performance.now();
   let firstChunkAt = null;
   let chunkCount = 0;
   let text = "";
+  const toolCalls = [];
 
-  // One span for the whole stream: it stays open until the stream is fully
-  // consumed or fails.
+  const finalize = (output, finishReason) => {
+    const after = readContextUsage(session);
+    reconcileContextOverflow(span, state, turnIndex, before, after);
+    span.setAttributes(
+      resultAttributes(
+        session,
+        state,
+        windowTokens,
+        before,
+        output,
+        finishReason,
+        after,
+      ),
+    );
+  };
+
+  const pump = async (controller) => {
+    const reader = session.promptStreaming(input, opts).getReader();
+    let chunk = await reader.read();
+    while (!chunk.done) {
+      chunkCount += 1;
+      firstChunkAt ??= performance.now();
+
+      if (typeof chunk.value === "string") {
+        text += chunk.value;
+      } else {
+        const call = toolCallFromChunk(chunk.value);
+        if (call) toolCalls.push(call);
+      }
+
+      controller.enqueue(chunk.value);
+      chunk = await reader.read();
+    }
+  };
+
   return new ReadableStream({
     async start(controller) {
+      let turn;
+      let endedAt;
       try {
-        for await (const chunk of session.promptStreaming(input, opts)) {
-          chunkCount += 1;
-          if (firstChunkAt === null) firstChunkAt = performance.now();
-          text += chunk;
-          controller.enqueue(chunk);
-        }
-        const after = readContextUsage(session);
-        reconcileContextOverflow(span, state, turnIndex, before, after);
-        span.setAttributes(
-          resultAttributes(session, state, windowTokens, before, text, "stop", after),
+        await context.with(spanContext, () => pump(controller));
+        endedAt = spanTimestamp();
+        // Registered before the attributes are written so the turn's own
+        // tool_call parts carry the ids the tool spans will be labelled with.
+        turn = {
+          text,
+          toolCalls: registerToolCalls(
+            state,
+            toolCalls,
+            exchange.toolParent(spanContext),
+            endedAt,
+          ),
+        };
+        finalize(
+          turn,
+          turn.toolCalls.length > 0 ? FINISH_TOOL_CALL : FINISH_STOP,
         );
         span.setStatus({ code: SpanStatusCode.OK });
         controller.close();
       } catch (err) {
-        const after = readContextUsage(session);
-        reconcileContextOverflow(span, state, turnIndex, before, after);
-        // Keep the partial text: seeing where generation stopped is the point.
-        span.setAttributes(
-          resultAttributes(
-            session,
-            state,
-            windowTokens,
-            before,
-            text,
-            finishReasonFor(err),
-            after,
-          ),
-        );
+        finalize({ text, toolCalls }, finishReasonFor(err));
         recordError(span, err);
         controller.error(err);
       } finally {
+        // Unset only when the turn failed before it could be timed.
+        endedAt ??= spanTimestamp();
         span.setAttribute(WEB_AI.CHUNK_COUNT, chunkCount);
         if (firstChunkAt !== null) {
-          // Seconds, per the convention.
           span.setAttribute(
             GEN_AI.TIME_TO_FIRST_CHUNK,
             (firstChunkAt - startedAt) / 1000,
           );
         }
         state.activeSpans.delete(span);
-        span.end();
+        span.end(endedAt);
+        exchange.settleTurn(turn, endedAt);
       }
     },
   });

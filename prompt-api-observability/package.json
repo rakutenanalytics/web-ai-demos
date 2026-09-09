@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Observability PoC for the Prompt API — browser-side OpenTelemetry GenAI tracing to MLflow.",
   "scripts": {
-    "start": "npx devtools-json-generator . && npx http-server",
+    "start": "npx devtools-json-generator . && npx http-server -c-1",
     "mlflow": "uvx mlflow server",
     "fix": "prettier --write ."
   },

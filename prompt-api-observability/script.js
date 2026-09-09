@@ -6,25 +6,57 @@
 import { marked } from "https://cdn.jsdelivr.net/npm/marked@13.0.3/lib/marked.esm.js";
 import DOMPurify from "https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.es.mjs";
 
-import { initTelemetry, createInstrumentedSession } from "./telemetry.js";
+import {
+  initTelemetry,
+  createInstrumentedSession,
+  flushTelemetry,
+} from "./telemetry.js";
 
 const NUMBER_FORMAT_LANGUAGE = "en-US";
 const SYSTEM_PROMPT = "You are a helpful and friendly assistant.";
 const TOOL_SYSTEM_PROMPT =
   "You are a helpful assistant. Answer questions by calling the tools you " +
-  "have when you need the current time or the weather in a city. Call every " +
-  "tool you need, then answer in one short sentence using only what the " +
-  "tools returned.";
+  "have when you need the current time, date in the future or a weather forecast. " +
+  "get_weather needs a city and an ISO date (YYYY-MM-DD) for the day being " +
+  "asked about; call get_current_time first when you need today's date to " +
+  "work out a relative day like tomorrow or next Friday. Call every tool you " +
+  "need, then answer in one short sentence using only what the tools returned.";
 
 const MAX_TOOL_CALLS = 8;
 
-// Mock weather keyed by city. `get_weather` stamps each answer with the
-// current time so the model can relate conditions to "now".
-const WEATHER = {
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+const CITY_WEATHER = {
   tokyo: { tempC: 24, conditions: "clear" },
   kyoto: { tempC: 22, conditions: "light rain" },
   osaka: { tempC: 26, conditions: "cloudy" },
 };
+
+const CONDITIONS = ["clear", "partly cloudy", "cloudy", "light rain", "rain"];
+
+function parseIsoDate(date) {
+  if (!ISO_DATE.test(date)) {
+    throw new Error(
+      'Use an ISO calendar date (YYYY-MM-DD), for example "2026-03-12".',
+    );
+  }
+  return date;
+}
+
+/** Fake forecast for any date — stable per city and day, varied enough to tell apart. */
+function forecastFor(city, date) {
+  const base = CITY_WEATHER[city];
+  let hash = 0;
+  const key = `${city}:${date}`;
+  for (let i = 0; i < key.length; i++) {
+    hash = (hash * 31 + key.charCodeAt(i)) | 0;
+  }
+  const h = Math.abs(hash);
+  return {
+    tempC: base.tempC + (h % 7) - 3,
+    conditions: CONDITIONS[h % CONDITIONS.length],
+  };
+}
 
 const tools = [
   {
@@ -47,8 +79,9 @@ const tools = [
   {
     name: "get_weather",
     description:
-      "Get the current weather for a city at the present moment. Only " +
-      "Tokyo, Kyoto and Osaka are known.",
+      "Get the weather forecast for a city on a specific calendar day. Only " +
+      "Tokyo, Kyoto and Osaka are known. Call get_current_time first when " +
+      "you need today's date to resolve a relative day like tomorrow.",
     inputSchema: {
       type: "object",
       properties: {
@@ -56,25 +89,25 @@ const tools = [
           type: "string",
           description: 'The city name, for example "Kyoto".',
         },
+        date: {
+          type: "string",
+          description: "ISO calendar date for the forecast day (YYYY-MM-DD).",
+        },
       },
-      required: ["city"],
+      required: ["city", "date"],
     },
-    execute({ city }) {
-      const now = new Date();
+    execute({ city, date }) {
       const key = String(city ?? "").toLowerCase();
-      const base = WEATHER[key];
-      if (!base) {
+      if (!CITY_WEATHER[key]) {
         return Promise.reject(
           new Error(`No weather for "${city}". Try Tokyo, Kyoto or Osaka.`),
         );
       }
-      return Promise.resolve({
-        city,
-        observedAt: now.toISOString(),
-        localTime: now.toLocaleString(),
-        tempC: base.tempC,
-        conditions: base.conditions,
-      });
+
+      const day = parseIsoDate(String(date ?? ""));
+      const { tempC, conditions } = forecastFor(key, day);
+
+      return Promise.resolve({ city, date: day, tempC, conditions });
     },
   },
 ];
@@ -169,12 +202,12 @@ function toolResponsePart(call, outcome) {
  * Streams one model turn. Text chunks are passed to `onText` when provided;
  * tool-call chunks are collected for the caller to run.
  */
-async function streamTurn(input, onText) {
+async function streamTurn(activeSession, input, onText) {
   const calls = [];
   let text = "";
   let previousChunk = "";
 
-  for await (const chunk of session.promptStreaming(input)) {
+  for await (const chunk of activeSession.promptStreaming(input)) {
     if (typeof chunk !== "string") {
       if (chunk?.type === "tool-call") {
         calls.push(chunk.value);
@@ -197,8 +230,8 @@ async function streamTurn(input, onText) {
  * Runs the tool loop until the model answers with text. Tool calls happen
  * silently: the UI only sees the final streamed answer, same as a plain turn.
  */
-async function promptWithTools(prompt, onText) {
-  let { calls, text } = await streamTurn(prompt);
+async function promptWithTools(activeSession, prompt, onText) {
+  let { calls, text } = await streamTurn(activeSession, prompt);
 
   if (!calls.length) {
     onText(text);
@@ -220,6 +253,7 @@ async function promptWithTools(prompt, onText) {
     }
 
     ({ calls, text } = await streamTurn(
+      activeSession,
       [{ role: "user", content: responses }],
       onText,
     ));
@@ -289,7 +323,7 @@ async function promptWithTools(prompt, onText) {
       }
 
       if (toolsEnabled) {
-        await promptWithTools(prompt, renderText);
+        await promptWithTools(session, prompt, renderText);
       } else {
         let result = "";
         let previousChunk = "";
@@ -313,6 +347,7 @@ async function promptWithTools(prompt, onText) {
       copyLinkButton.style.display = "inline-block";
       copyHelper.style.display = "inline";
       updateStats();
+      await flushTelemetry();
     }
   };
 
@@ -446,10 +481,7 @@ async function promptWithTools(prompt, onText) {
     if (self.LanguageModel) {
       const options = {
         expectedInputs: toolsEnabled
-          ? [
-              { type: "text", languages: ["en"] },
-              { type: "tool-response" },
-            ]
+          ? [{ type: "text", languages: ["en"] }, { type: "tool-response" }]
           : [
               {
                 type: "text",

@@ -16,13 +16,11 @@ A copy of the Prompt API playground with a thin OpenTelemetry layer added. The c
 
 ### Changes vs prompt-api-playground
 
-
 | File           | Role                                                                                                        |
 | -------------- | ----------------------------------------------------------------------------------------------------------- |
 | `telemetry.js` | OpenTelemetry setup, MLflow OTLP export (`localhost:5000`, experiment `0`), Prompt API span instrumentation |
 | `script.js`    | Wires telemetry in; replaces `LanguageModel.create()` with `createInstrumentedSession()`                    |
 | `index.html`   | OpenTelemetry import map (SDK loaded from esm.sh)                                                           |
-
 
 Suggested review order: this README → `script.js` (diff vs playground) → `telemetry.js`.
 
@@ -56,6 +54,17 @@ npm start
 `npm start` generates a [DevTools Workspace](https://developer.chrome.com/docs/devtools/workspaces) mapping (`.well-known/appspecific/com.chrome.devtools.json`, gitignored), then serves the app at [http://localhost:8080](http://localhost:8080).
 
 Submit a prompt in the browser. Traces appear in MLflow → **Default** experiment (ID `0`) → **Traces** tab.
+
+When tool calling is enabled, a multi-turn exchange is grouped under one `invoke_agent` root span. Model turns and tool runs are siblings underneath it:
+
+```
+invoke_agent
+├── generate_content   (model asks for tools)
+├── execute_tool …     (one span per tool response sent back)
+└── generate_content   (final answer)
+```
+
+The root span carries the original user question and the final assistant answer so MLflow's trace preview shows the completed exchange. Tool definitions are recorded on `web_ai.create_session`; each `execute_tool` span records arguments and results when `CAPTURE_CONTENT` is true.
 
 To send to any other OTLP backend instead:
 
