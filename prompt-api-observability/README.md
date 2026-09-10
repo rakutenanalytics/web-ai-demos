@@ -1,8 +1,9 @@
 # Prompt API Observability
 
-Observability PoC for the [Prompt API](https://webmachinelearning.github.io/prompt-api/) — a standalone demo based on `[prompt-api-playground](https://chrome.dev/web-ai-demos/prompt-api-playground/)`.
+Observability PoC for the [Prompt API](https://webmachinelearning.github.io/prompt-api/) — a standalone demo based on [prompt-api-playground](https://chrome.dev/web-ai-demos/prompt-api-playground/).
 
-The Prompt API lets web apps call on-device language models directly from JavaScript (`LanguageModel.create`, `prompt`, `promptStreaming`, …). Implementations are available in browsers today; the API is being developed as an open web standard. This demo shows how to instrument those client-side calls and export traces to a local observability backend.
+The Prompt API lets web apps call on-device language models directly from JavaScript (`LanguageModel.create`, `prompt`, `promptStreaming`, …). Implementations are available in browsers today; the API is being developed as an [open web standard](https://github.com/webmachinelearning/prompt-api). 
+This demo shows how to instrument client-side calls and export traces to a local observability backend.
 
 ## Motivation
 
@@ -66,20 +67,11 @@ invoke_agent
 
 The root span carries the original user question and the final assistant answer so MLflow's trace preview shows the completed exchange. Tool definitions are recorded on `web_ai.create_session`; each `execute_tool` span records arguments and results when `CAPTURE_CONTENT` is true.
 
-To send to any other OTLP backend instead:
-
-```js
-await initTelemetry({
-  otlpUrl: "http://localhost:4318/v1/traces",
-  otlpHeaders: {},
-});
-```
-
 ## Future work
 
 **Extend OpenTelemetry Semantic Conventions** - extend the [OpenTelemetry GenAI Semantic Conventions](https://github.com/open-telemetry/semantic-conventions-genai) with Built-in AI specific conventions. Confirm if this would be in scope of the [Distributed Tracing Working Group](https://www.w3.org/groups/wg/distributed-tracing/publications/)
 
-**Typed npm SDK** — publish a package that bundles OpenTelemetry setup and Prompt API instrumentation so developers add a dependency instead of copying `telemetry.js`.
+**npm SDK** — publish a package that bundles OpenTelemetry setup and Prompt API instrumentation so developers add a dependency instead of copying `telemetry.js`.
 
 **Other built-in AI APIs** — extend the same pattern to Summarizer, Translator, Writer, and the other [browser built-in AI APIs](https://developer.chrome.com/docs/ai/built-in-apis).
 

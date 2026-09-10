@@ -54,6 +54,13 @@ const GEN_AI = {
   TOOL_DESCRIPTION: "gen_ai.tool.description",
   TOOL_TYPE: "gen_ai.tool.type",
   TOOL_CALL_ID: "gen_ai.tool.call.id",
+  /**
+   * Opt-in in the spec, so both are gated on CAPTURE_CONTENT. The spec asks for
+   * a structured object and allows a JSON string where the format cannot carry
+   * one, which is the case for OTel span attributes.
+   */
+  TOOL_CALL_ARGUMENTS: "gen_ai.tool.call.arguments",
+  TOOL_CALL_RESULT: "gen_ai.tool.call.result",
 };
 
 /**
@@ -85,9 +92,6 @@ const WEB_AI = {
   TOOL_CALL_NAMES: "web_ai.tool.call_names",
   TOOL_RESPONSE_COUNT: "web_ai.tool.response_count",
   TOOL_CALL_INDEX: "web_ai.tool.call_index",
-  TOOL_CALL_ARGUMENTS: "web_ai.tool.call_arguments",
-  TOOL_RESULT: "web_ai.tool.result",
-  TOOL_FAILED: "web_ai.tool.failed",
   TURN_CONTINUATION: "web_ai.conversation.turn_continuation",
   EXCHANGE_TURN_COUNT: "web_ai.exchange.turn_count",
   EXCHANGE_TOOL_CALL_COUNT: "web_ai.exchange.tool_call_count",
@@ -99,9 +103,8 @@ const SESSION_ID = "session.id";
 
 /**
  * MLflow's trace-table preview (mlflow/tracing/utils/truncation.py) understands
- * OpenAI-shaped `{messages: [{role, content}]}` on mlflow.spanInputs/Outputs,
- * not GenAI `parts` arrays. Set these alongside gen_ai.* so the Response column
- * shows plain text; span detail still uses the GenAI attributes.
+ * OpenAI-shaped `{messages: [...]}` on mlflow.spanInputs/Outputs, not GenAI
+ * `parts` arrays. Always set alongside gen_ai.*; see mlflowChatPreview.
  */
 const MLFLOW_INPUTS = "mlflow.spanInputs";
 const MLFLOW_OUTPUTS = "mlflow.spanOutputs";
@@ -410,20 +413,68 @@ function encodeOutputMessages(output, finishReason) {
   return [{ role: "assistant", parts, finish_reason: finishReason }];
 }
 
-/** Flatten GenAI message parts to plain text for MLflow list previews. */
-function textFromGenAiMessages(messages) {
-  const lines = [];
-  for (const message of messages) {
-    for (const part of message.parts ?? []) {
-      if (part.type === "text" && part.content) lines.push(part.content);
-    }
-  }
-  return lines.join("\n");
+function mlflowToolCall(part) {
+  const call = {
+    type: TOOL_TYPE_FUNCTION,
+    // OpenAI carries arguments as a JSON string, not as an object.
+    function: { name: part.name, arguments: safeJson(part.arguments ?? {}) },
+  };
+  if (part.id) call.id = part.id;
+  return call;
 }
 
-/** OpenAI-shaped JSON for MLflow request/response preview columns. */
-function mlflowChatPreview(role, text) {
-  return JSON.stringify({ messages: [{ role, content: text }] });
+/** A result is its own message here, whatever role the Prompt API used. */
+function mlflowToolMessage(part) {
+  const message = {
+    role: "tool",
+    content: safeJson(part.error === undefined ? part.response : part.error),
+  };
+  if (part.id) message.tool_call_id = part.id;
+  return message;
+}
+
+/** Splits one message's parts into the pieces the OpenAI shape needs. */
+function shapeParts(parts) {
+  const shaped = { text: [], toolCalls: [], toolMessages: [] };
+  for (const part of parts) {
+    if (part.type === "text") {
+      shaped.text.push(part.content);
+    } else if (part.type === "tool_call") {
+      shaped.toolCalls.push(mlflowToolCall(part));
+    } else if (part.type === "tool_call_response") {
+      shaped.toolMessages.push(mlflowToolMessage(part));
+    } else {
+      // Enough to show the turn carried an image or audio, never the value.
+      shaped.text.push(`[${part.modality}]`);
+    }
+  }
+  return shaped;
+}
+
+function openAiMessages(message) {
+  const { text, toolCalls, toolMessages } = shapeParts(message.parts ?? []);
+  if (text.length === 0 && toolCalls.length === 0) return toolMessages;
+
+  const entry = { role: message.role, content: text.join("\n") || null };
+  if (toolCalls.length > 0) entry.tool_calls = toolCalls;
+  return [...toolMessages, entry];
+}
+
+/**
+ * Re-shapes GenAI messages as OpenAI chat messages for MLflow.
+ *
+ * MLflow reads mlflow.spanInputs/Outputs both for the trace-table preview
+ * columns and for a span's "Pretty" view. Left unset it derives them from the
+ * GenAI attributes and then renders the derived copy alongside the original, so
+ * every message appears twice; setting them here is what keeps a turn rendering
+ * once. Tool calls and results have to come across too, or the turns that carry
+ * nothing but tool traffic preview as blank.
+ */
+function mlflowChatPreview(messages) {
+  const chat = messages.flatMap(openAiMessages);
+  return chat.length > 0
+    ? truncateAttribute(JSON.stringify({ messages: chat }))
+    : undefined;
 }
 
 /**
@@ -435,14 +486,6 @@ function mlflowSessionAttributes(conversationId, sessionId) {
     [GEN_AI.CONVERSATION_ID]: conversationId,
     [SESSION_ID]: sessionId,
   };
-}
-
-/** Plain text from GenAI system-instruction parts. */
-function textFromSystemInstructions(parts) {
-  return parts
-    .map((part) => (part.type === "text" ? part.content : ""))
-    .filter(Boolean)
-    .join("\n");
 }
 
 // --- Context measurements --------------------------------------------------
@@ -557,13 +600,13 @@ function createSessionAttributes(options = {}) {
     const instructions = encodeSystemInstructions(options.initialPrompts);
     if (instructions) {
       attributes[GEN_AI.SYSTEM_INSTRUCTIONS] = JSON.stringify(instructions);
-      const text = textFromSystemInstructions(instructions);
-      if (text) {
-        // Session Input preview uses the first trace (create_session); show the system
-        // prompt because there is no user message yet. role=system — MLflow looks for
-        // user first, then falls back to the last message in the preview JSON.
-        attributes[MLFLOW_INPUTS] = mlflowChatPreview("system", text);
-      }
+      // Session Input preview uses the first trace (create_session); show the system
+      // prompt because there is no user message yet. role=system — MLflow looks for
+      // user first, then falls back to the last message in the preview JSON.
+      const preview = mlflowChatPreview([
+        { role: "system", parts: instructions },
+      ]);
+      if (preview) attributes[MLFLOW_INPUTS] = preview;
     }
   }
 
@@ -702,13 +745,12 @@ function toolSpanAttributes(state, response, pending) {
   const description = state.tools.get(name)?.description;
   if (description) attributes[GEN_AI.TOOL_DESCRIPTION] = description;
   if (CAPTURE_CONTENT && pending?.arguments !== undefined) {
-    attributes[WEB_AI.TOOL_CALL_ARGUMENTS] = safeJson(pending.arguments);
+    attributes[GEN_AI.TOOL_CALL_ARGUMENTS] = safeJson(pending.arguments);
   }
+  // The spec records a result only for a call that succeeded; a failure is left
+  // to `error.type` and the span status.
   if (CAPTURE_CONTENT && response.result !== undefined) {
-    attributes[WEB_AI.TOOL_RESULT] = safeJson(response.result);
-  }
-  if (response.errorMessage !== undefined) {
-    attributes[WEB_AI.TOOL_FAILED] = true;
+    attributes[GEN_AI.TOOL_CALL_RESULT] = safeJson(response.result);
   }
 
   return attributes;
@@ -768,11 +810,8 @@ function exchangeAttributes(state, input) {
     attributes[GEN_AI.INPUT_MESSAGES] = truncateAttribute(
       JSON.stringify(inputMessages),
     );
-    const previewText =
-      typeof input === "string" ? input : textFromGenAiMessages(inputMessages);
-    if (previewText) {
-      attributes[MLFLOW_INPUTS] = mlflowChatPreview("user", previewText);
-    }
+    const preview = mlflowChatPreview(inputMessages);
+    if (preview) attributes[MLFLOW_INPUTS] = preview;
   }
 
   return attributes;
@@ -791,13 +830,12 @@ function exchangeResultAttributes(exchange, output) {
 
   attributes[GEN_AI.FINISH_REASONS] = [FINISH_STOP];
   if (CAPTURE_CONTENT) {
-    const text = typeof output === "string" ? output : output.text;
+    const outputMessages = encodeOutputMessages(output, FINISH_STOP);
     attributes[GEN_AI.OUTPUT_MESSAGES] = truncateAttribute(
-      JSON.stringify(encodeOutputMessages(output, FINISH_STOP)),
+      JSON.stringify(outputMessages),
     );
-    if (text) {
-      attributes[MLFLOW_OUTPUTS] = mlflowChatPreview("assistant", text);
-    }
+    const preview = mlflowChatPreview(outputMessages);
+    if (preview) attributes[MLFLOW_OUTPUTS] = preview;
   }
 
   return attributes;
@@ -1004,11 +1042,8 @@ function requestAttributes(state, input, opts, streaming, traffic) {
     attributes[GEN_AI.INPUT_MESSAGES] = truncateAttribute(
       JSON.stringify(inputMessages),
     );
-    const previewText =
-      typeof input === "string" ? input : textFromGenAiMessages(inputMessages);
-    if (previewText) {
-      attributes[MLFLOW_INPUTS] = mlflowChatPreview("user", previewText);
-    }
+    const preview = mlflowChatPreview(inputMessages);
+    if (preview) attributes[MLFLOW_INPUTS] = preview;
   }
 
   return attributes;
@@ -1047,13 +1082,12 @@ function resultAttributes(
 
   Object.assign(attributes, toolCallAttributes(output));
   if (CAPTURE_CONTENT) {
+    const outputMessages = encodeOutputMessages(output, finish);
     attributes[GEN_AI.OUTPUT_MESSAGES] = truncateAttribute(
-      JSON.stringify(encodeOutputMessages(output, finish)),
+      JSON.stringify(outputMessages),
     );
-    const text = typeof output === "string" ? output : output.text;
-    if (text) {
-      attributes[MLFLOW_OUTPUTS] = mlflowChatPreview("assistant", text);
-    }
+    const preview = mlflowChatPreview(outputMessages);
+    if (preview) attributes[MLFLOW_OUTPUTS] = preview;
   }
   return attributes;
 }
