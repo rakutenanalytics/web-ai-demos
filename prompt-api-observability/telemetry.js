@@ -817,10 +817,17 @@ function exchangeAttributes(state, input) {
   return attributes;
 }
 
-function exchangeResultAttributes(exchange, output) {
+function exchangeResultAttributes(
+  exchange,
+  output,
+  windowTokens,
+  usageBefore,
+  usageAfter,
+) {
   const attributes = {
     [WEB_AI.EXCHANGE_TURN_COUNT]: exchange.turns,
     [WEB_AI.EXCHANGE_TOOL_CALL_COUNT]: exchange.toolCalls,
+    ...contextAttributes(windowTokens, usageBefore, usageAfter),
   };
 
   if (output === undefined) {
@@ -877,7 +884,15 @@ function wrapSession(session, meta, createOptions = {}) {
     if (!exchange) return;
     state.exchange = undefined;
     state.pendingCalls = [];
-    exchange.span.setAttributes(exchangeResultAttributes(exchange, output));
+    exchange.span.setAttributes(
+      exchangeResultAttributes(
+        exchange,
+        output,
+        exchange.windowTokens ?? readContextWindow(session),
+        exchange.usageBefore,
+        readContextUsage(session),
+      ),
+    );
     exchange.span.setStatus({ code: SpanStatusCode.OK });
     // Ends where its last turn ended, so the root always covers its children.
     exchange.span.end(at);
@@ -896,7 +911,14 @@ function wrapSession(session, meta, createOptions = {}) {
       context.active(),
     );
     const spanContext = trace.setSpan(context.active(), span);
-    state.exchange = { span, context: spanContext, turns: 0, toolCalls: 0 };
+    state.exchange = {
+      span,
+      context: spanContext,
+      turns: 0,
+      toolCalls: 0,
+      windowTokens: readContextWindow(session),
+      usageBefore: readContextUsage(session),
+    };
     return spanContext;
   };
 
